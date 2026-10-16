@@ -9,10 +9,16 @@
 # 只有 LF 时解析器会错位（把菜单行拆成乱码命令）。
 *.bat text eol=crlf
 
+# shell 脚本反过来必须 LF —— bash 会把行尾的 CR 当成命令的一部分，
+# 报 `$'\r': command not found`。放 U 盘上跑时 exFAT 没有可执行位，
+# 只能 `bash 启动AI.sh` 这样显式调用，行尾错了第一行就炸。
+*.sh text eol=lf
+
 # 二进制，不要碰
 *.png  binary
 *.jpg  binary
 *.zip  binary
+*.tar.gz binary
 *.gguf binary
 *.exe  binary
 *.dll  binary

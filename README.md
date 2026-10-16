@@ -1,6 +1,6 @@
 # portable-ai-usb · 零联网便携 AI
 
-> 把一个大模型装进 U 盘。插到任何一台 Windows 电脑上双击就能用，**用的时候全程不需要网络**。
+> 把一个大模型装进 U 盘。插到任何一台 Windows 电脑上双击就能用，macOS / Linux 上也能跑，**用的时候全程不需要网络**。
 
 ![界面截图：浏览器里的聊天界面，模型 MiMo-V2.6-Distill-Qwen-9B，右下角显示当前模型](docs/界面截图.png)
 
@@ -85,29 +85,52 @@ powershell -ExecutionPolicy Bypass -File tools\准备U盘.ps1
 
 ### 2. 使用（不需要联网）
 
-U 盘插到任意 Windows 电脑上，双击：
+**Windows** —— U 盘插到任意 Windows 电脑上，双击：
 
 ```
 启动AI.bat
 ```
 
-等 10~40 秒，浏览器自动打开。开始对话。
+**macOS / Linux** —— 同一支盘，同一个 `models/`，换个调用方式：
+
+```sh
+bash 启动AI.sh              # 自动挑模型、自动挑引擎
+bash 启动AI.sh --list       # 看看盘里有哪些模型
+bash 启动AI.sh --help       # 全部选项
+```
+
+首次约 50 秒（取决于 U 盘读取速度，启动器会现场测并给出预估），之后热启动约 10 秒。浏览器自动打开，开始对话。
+
+> U 盘一般是 exFAT，exFAT 没有 Unix 权限位，`chmod +x` 存不住 —— 所以是 `bash 启动AI.sh`
+> 这样显式调用，而不是 `./启动AI.sh`。
+>
+> **模型文件跨平台通用，引擎不通用。** `models/*.gguf` 两边都能直接用；
+> 但 `llama.cpp/` 下要给 macOS / Linux 各放一份引擎（缺的时候脚本会告诉你该下哪个）。
+> 只做 `准备U盘.ps1` 的话盘里只有 Windows 引擎 —— 这是有意的，那三套已经 850 MB 了。
 
 ### 3. 需要手动挡的时候
 
-双击 `高级选项.bat`：
+Windows 双击 `高级选项.bat`：
 
 ```
-[1] NVIDIA 显卡 - 标准      32K 上下文   (最常用)
-[2] NVIDIA 显卡 - 大上下文  64K 上下文   (长文档/长对话)
-[3] NVIDIA 显卡 - 省显存     8K 上下文   (小显存机)
-[4] AMD / Intel 显卡 (Vulkan)
-[5] 纯 CPU 模式              任何电脑都能跑，速度慢
-[6] 仅检测硬件，不启动
-[7] 停止本 U 盘的 AI         不会影响电脑上其它的 llama-server
-[8] 打开 AI 网页界面
-[9] 环境自检                 U盘文件是否齐全
+[1]  NVIDIA  -  32K 上下文   (最常用)
+[2]  NVIDIA  -  64K 上下文   (长文档 / 长对话)
+[3]  NVIDIA  -   8K 上下文   (小显存机)
+
+[4]  AMD / Intel 显卡  (Vulkan)
+[5]  纯 CPU 模式  (任何电脑都能跑, 速度慢)
+
+[6]  仅检测硬件, 不启动
+[7]  停止本 U 盘的 AI
+[8]  打开 AI 网页界面
+[9]  环境自检  (U盘文件是否齐全)
+[10] 选择使用哪个模型  (models\ 下有多个时)
+[11] 测一下这支 U 盘的速度  (看看要等多久)
+[12] 启动  -  不用 mmap  (慢盘卡顿时用, 占内存)
 ```
+
+macOS / Linux 上是同一套能力的命令行开关：`--model` / `--probe` / `--stop` /
+`--bench` / `--ctx` / `--ngl` / `--load-mode`，`--help` 里列全了。
 
 ---
 
@@ -212,7 +235,8 @@ llama.cpp 官方的 Windows 包已经做了**运行时 CPU 分发**
 
 ```
 U盘根目录/
-├── 启动AI.bat              ← 双击这个
+├── 启动AI.bat              ← Windows：双击这个
+├── 启动AI.sh               ← macOS / Linux：bash 启动AI.sh
 ├── 高级选项.bat            ← 手动选后端
 ├── launcher.ps1            ← 启动器（自动探测 + 三级降级）
 ├── 使用说明.txt
@@ -220,19 +244,29 @@ U盘根目录/
 ├── llama.cpp/
 │   ├── cuda13/             ← llama-server.exe + 依赖 DLL（含 vcruntime，app-local）
 │   ├── vulkan/
-│   └── cpu/
+│   ├── cpu/
+│   └── macos-arm64/ …      ← 非 Windows 引擎放这里（按需自己下）
 ├── models/
-│   └── MiMo-V2.6-Distill-Qwen-9B-Q5_K_M.gguf
+│   ├── MiMo-V2.6-Distill-Qwen-9B-Q5_K_M.gguf
+│   └── 当前模型.txt        ← 有多个模型时指定用哪个
+├── tools/                  ← 准备U盘 / 换模型 / 自检 / 菜单
 └── logs/                   ← 运行日志（自动创建）
 ```
 
 **整个目录是自包含的。** 把它拷到另一个 U 盘、另一个分区、另一个盘符，一样能跑。
-`launcher.ps1` 里所有路径都由 `$PSScriptRoot` 拼出来，没有任何一处写死盘符。
+`launcher.ps1` 里所有路径都由 `$PSScriptRoot` 拼出来，`启动AI.sh` 用脚本自身所在目录，
+两边都没有任何一处写死盘符。
 
-**改脚本之前先看这条。** `launcher.ps1` 和 `tools/*.ps1` 必须存成 **UTF-8 带 BOM**。
-Windows PowerShell 5.1 读没有 BOM 的文件时会按系统 ANSI 码页解码，脚本里的中文直接变乱码
-（不是显示问题，是读进去就错了）。好几种编辑器会默认把 BOM 去掉，改完记得确认一下。
-`.bat` 反过来要**不带 BOM** —— BOM 会被 cmd 当成一条命令去执行。
+**改脚本之前先看这条。** 三种文件的行尾和 BOM 要求各不相同，错了都是"读进去就坏"，不是显示问题：
+
+| 文件 | 编码 | 行尾 | 错了会怎样 |
+|---|---|---|---|
+| `.ps1` | **UTF-8 带 BOM** | LF | 无 BOM 时 PowerShell 5.1 按 ANSI 码页解码，中文全变乱码 |
+| `.bat` | **不带 BOM** | **CRLF** | 带 BOM 时 cmd 会把 BOM 当成一条命令去执行；LF 时按 CRLF 切分会错位 |
+| `.sh` | 不带 BOM | **LF** | 行尾带 CR 时 bash 报 `$'\r': command not found` |
+
+`.gitattributes` 里已经按这个表配好了（`* text=auto eol=lf`、`*.bat eol=crlf`、`*.sh eol=lf`），
+但好几种编辑器会**默认把 BOM 去掉**，改完 `.ps1` 记得确认一下。
 
 ---
 
@@ -241,7 +275,7 @@ Windows PowerShell 5.1 读没有 BOM 的文件时会按系统 ANSI 码页解码�
 |  | 最低 | 推荐 |
 |---|---|---|
 | U 盘 | USB 3.0，16 GB，exFAT | USB 3.0+，64 GB |
-| 系统 | Windows 10 / 11 x64 | Windows 11 x64 |
+| 系统 | Windows 10 / 11 x64；macOS 11+；Linux x64 | Windows 11 x64 |
 | 内存 | 8 GB | 16 GB+ |
 | 显卡 | 无所谓（会降到 CPU） | NVIDIA（走 CUDA）或任意支持 Vulkan 的卡 |
 
@@ -278,10 +312,12 @@ Windows PowerShell 5.1 读没有 BOM 的文件时会按系统 ANSI 码页解码�
 
 ### 平台
 
-- **只有 Windows。** 启动器、菜单、运行库部署全是 Windows 专用的，macOS / Linux 上用不了这套脚本。
-  模型文件（`.gguf`）本身通用，那边要另配引擎。这是有意的取舍，见下面的 Roadmap。
+- **Windows 是主战场，macOS / Linux 能用但要自己补引擎。** `启动AI.sh` 在两边都能跑
+  （自动探测、挑模型、测速、启停都有），但 `准备U盘.ps1` 只往盘里装 Windows 那三套引擎 ——
+  Apple Silicon 上还多一层：官方预编译包是 macOS 11+ 的，老系统得自己编。
+  引擎缺的时候脚本会直接告诉你下哪个文件、放哪个目录，不会去网上乱找。
 - **Windows 11 S 模式** 会拒绝运行非商店应用，需要先退出 S 模式。
-- **Windows on ARM**（骁龙本）没有对应引擎包，跑不了。
+- **Windows on ARM**（骁龙本）没有对应引擎包，跑不了。macOS 的 Apple Silicon 是原生 arm64，没问题。
 
 ### 权限与环境
 
@@ -302,11 +338,15 @@ Windows PowerShell 5.1 读没有 BOM 的文件时会按系统 ANSI 码页解码�
 ### 能力
 
 - **模型是 9B。** 它能做工具调用、能写代码、中文也可以，但它不是 GPT-4 级别的模型。
-  需要更强的话往 `models\` 里换更大的 GGUF 就行 —— 见 [使用说明.txt](使用说明.txt) 的「换模型」一节。
+  需要更强的话往 `models\` 里换更大的 GGUF 就行。
+  盘里带了 [tools\换模型.ps1](tools/换模型.ps1)，列了几个已知能跑的小模型直接下 ——
+  也可以用 `高级选项.bat` 的 [10] 在已有模型之间切换。详见 [使用说明.txt](使用说明.txt)。
 - **上下文默认 32K**，不是无限的。显存够的机器可以用 `高级选项.bat` 的 [2] 开到 64K。
 - **界面就是 llama.cpp 自带的 WebUI**，够用但很朴素，没有对话历史管理。
-- **多模态未启用。** MiMo 有视觉能力，但需要额外下载 `mmproj-*.gguf` 并给 llama-server 加 `--mmproj`，
-  当前启动器没有做这一步。
+- **看图能力默认是关的。** MiMo 有视觉能力，但需要额外把 `mmproj-*.gguf` 放进 `models\`。
+  启动器会自己检测：有就打开（并明确打印文件名），没有就**显式传给引擎 `--no-mmproj`**。
+  显式关掉这一步不是可选项 —— 引擎在"没给投影文件"时存在自己去下载的路径，那就要联网，
+  而这个盘的卖点之一就是首次启动完全离线。
 
 更多见 [docs/常见问题.md](docs/常见问题.md)。
 
@@ -322,12 +362,11 @@ PowerShell 的大小写陷阱…… 每条都带报错原文，方便搜过来�
 
 ### 想做
 
-- [ ] **macOS / Linux 启动器** —— 复用同一套 `models\` 与 `llama.cpp\` 目录约定，另写一个 bash 启动器。
-      工程量主要在三套引擎的 `.so` / `.dylib` 分发上。
 - [ ] **一段 GIF** —— 截图已经有了，但"插上 → 双击 → 开始对话"这 15 秒的过程，
       动态演示比静态图更有说服力。
-- [ ] **多模态开关** —— 检测到 `models\mmproj-*.gguf` 就自动加 `--mmproj`，把视觉能力打开。
-- [ ] **换模型脚本** —— `tools\换模型.ps1`：列出几个已知能跑的小模型，选一个下进 `models\`。
+- [ ] **让 [docs/硬件与性能.md](docs/硬件与性能.md) 里的表格带上更多真实机器的数据** ——
+      这一条靠 [硬件兼容性反馈](.github/ISSUE_TEMPLATE/hardware_report.yml) 里收到的记录，
+      我一个人凑不出来（见下面的"参与"）。
 
 ### 明确不做
 
@@ -335,6 +374,8 @@ PowerShell 的大小写陷阱…… 每条都带报错原文，方便搜过来�
 - **不把模型打包进仓库。** 6.4 GB 放不进 Git，也放不进大多数人的耐心。
 - **不盲目追最新引擎版本。** 现在锁定 b11270 并校验 SHA-256；升级要重新验三套后端的
   `--list-devices` 与显存分档，不是改个版本号的事。
+- **不在 U 盘里塞四个平台的引擎。** 加一套就多几百 MB 到 1 GB。现在盘里只放 Windows 那三套；
+  别的平台缺引擎时脚本告诉你下哪个，一条 `curl` 的事。
 
 ### 已完成
 
@@ -344,8 +385,10 @@ PowerShell 的大小写陷阱…… 每条都带报错原文，方便搜过来�
 - [x] [开发过程踩坑记录](docs/踩坑记录.md)（v1.1.0）
 - [x] **U 盘速度自测 + 加载时间预估**（v1.1.1）—— 启动时实测顺序读，报"预计约 N 秒"；菜单 `[11]` 可单独测
 - [x] **慢盘兜底开关**（v1.1.1）—— `-LoadMode none` / 菜单 `[12]`：不用 mmap，整块读进内存
-- [ ] 让 [docs/硬件与性能.md](docs/硬件与性能.md) 里的表格带上更多真实机器的数据 ——
-      这一条靠 [硬件兼容性反馈](.github/ISSUE_TEMPLATE/hardware_report.yml) 里收到的记录。
+- [x] **macOS / Linux 启动器**（v1.2.0）—— `启动AI.sh`，同一支盘同一份模型，两个平台的引擎按目录约定各放各的
+- [x] **多模态开关**（v1.2.0）—— 检测到 `models/mmproj-*.gguf` 就自动打开视觉能力，没有就显式关掉
+- [x] **换模型脚本**（v1.2.0）—— `tools/换模型.ps1`，从 HuggingFace 镜像下几个已知能跑的小模型
+- [x] **公共脚本抽取**（v1.2.0）—— `tools/_公共.ps1`：下载/校验/断点续传只有一份实现
 
 ---
 
@@ -354,8 +397,9 @@ PowerShell 的大小写陷阱…… 每条都带报错原文，方便搜过来�
 - **跑在什么机器上、什么结果** —— 请开一个 [硬件兼容性反馈](.github/ISSUE_TEMPLATE/hardware_report.yml)。
   这类记录比 Bug 报告更有用：它能进 [docs/硬件与性能.md](docs/硬件与性能.md)，让下一个人知道自己的机器行不行。
 - **改动之前**请看 [.github/pull_request_template.md](.github/pull_request_template.md) 里的**编码约定**。
-  那三条不是风格偏好，是踩过坑之后定下来的（cmd.exe 会把带中文的 `.bat` 解析错位、
-  PowerShell 5.1 会把没 BOM 的 `.ps1` 按 ANSI 码页读成乱码）。
+  那几条不是风格偏好，是踩过坑之后定下来的：cmd.exe 会把带中文的 `.bat` 解析错位、
+  PowerShell 5.1 会把没 BOM 的 `.ps1` 按 ANSI 码页读成乱码、
+  `.sh` 的行尾带上 CR 会让 bash 报 `$'\r': command not found`。
 - 完整变更历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---

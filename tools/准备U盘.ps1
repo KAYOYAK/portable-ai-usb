@@ -38,13 +38,22 @@ $ModelRepo  = "https://hf-mirror.com/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF/re
 $ModelFile  = "MiMo-V2.6-Distill-Qwen-9B-$Quant.gguf"
 
 # 官方预编译包（含大小与 SHA-256，下完自动校验）
+#
+# 这些值取自 GitHub Release 的资产元数据。两份 cuda13 曾经只写了大小、没写哈希，
+# 而且大小还是错的（152479372 / 423555290，实际 152497212 / 423535356）——
+# 也就是说 U 盘上已有引擎时这个分支永远走不到，一旦在干净机器上跑就会
+# 卡在「大小不对」上失败。现在两份都补上了真哈希，大小也不再是唯一防线。
+#
+# 想升级版本：改 $LlamaTag 后，用下面这条把新的名字/大小/哈希一次取全：
+#   (irm "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$LlamaTag" -Headers @{'User-Agent'='ps'}).assets |
+#     ? name -match 'win.*x64' | select name,size,digest
 $Engines = @{
     cpu    = @{ Zip = "llama-$LlamaTag-bin-win-cpu-x64.zip";    Size = 19165061; Sha = "4bb43ee0c7f4670d78087ba02eae7ae29b91e3d74eab3dbb337c6d0199bb7be0" }
     vulkan = @{ Zip = "llama-$LlamaTag-bin-win-vulkan-x64.zip"; Size = 33093376; Sha = "49366a9f824cdc9a937bfae9218cbb4adf0ff6bafc5b133ad7f03fb7940c1fb5" }
     cuda13 = @{
         Zips = @(
-            @{ Zip = "llama-$LlamaTag-bin-win-cuda-13.4-x64.zip";    Size = 152479372; Sha = "" }
-            @{ Zip = "cudart-llama-bin-win-cuda-13.4-x64.zip";       Size = 423555290; Sha = "" }
+            @{ Zip = "llama-$LlamaTag-bin-win-cuda-13.4-x64.zip";    Size = 152497212; Sha = "a5c78087ebd2ad10b38639cc3bd240fb843123d6e37cdfee5f41178a1d2354b9" }
+            @{ Zip = "cudart-llama-bin-win-cuda-13.4-x64.zip";       Size = 423535356; Sha = "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668" }
         )
     }
 }
@@ -57,79 +66,9 @@ $RuntimeDlls = @(
     "concrt140.dll", "vcomp140.dll"
 )
 
-$Root   = Split-Path -Parent $PSScriptRoot          # 仓库根目录
-$Stash  = Join-Path $env:TEMP "portable-ai-usb"     # 本机暂存（下载到这儿再拷过去）
-if (-not (Test-Path $Stash)) { New-Item -ItemType Directory -Force -Path $Stash | Out-Null }
-
-function Head($t) {
-    Write-Host ""
-    Write-Host ("=" * 68) -ForegroundColor DarkCyan
-    Write-Host ("  " + $t) -ForegroundColor Cyan
-    Write-Host ("=" * 68) -ForegroundColor DarkCyan
-}
-function Step($n, $t) { Write-Host ""; Write-Host "  [$n] $t" -ForegroundColor Yellow }
-function OK($t)   { Write-Host "      ✓ $t" -ForegroundColor Green }
-function Info($t) { Write-Host "      · $t" -ForegroundColor DarkGray }
-function Warn($t) { Write-Host "      ! $t" -ForegroundColor Yellow }
-function Die($t)  { Write-Host ""; Write-Host "  [错误] $t" -ForegroundColor Red; exit 1 }
-
-function Ask-Yes($q, $defYes = $true) {
-    if ($Yes) { return $true }
-    $s = if ($defYes) { "[Y/n]" } else { "[y/N]" }
-    $a = Read-Host "      $q $s"
-    if ([string]::IsNullOrWhiteSpace($a)) { return $defYes }
-    return ($a -match '^(?i)y')
-}
-
-# 断点续传下载。curl 的 -C - 会自动接上已有部分重新请求。
-# 注意：某些镜像（如 gh-proxy.com）在收到 Range 请求时会挂住，所以必须带 --max-time，
-#       每轮只跑 30 秒，靠外层循环累积进度。
-function Get-File {
-    param([string]$Url, [string]$Dest, [long]$Expected = 0)
-
-    $destDir = Split-Path -Parent $Dest
-    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
-
-    if ($Expected -gt 0 -and (Test-Path $Dest) -and (Get-Item $Dest).Length -eq $Expected) {
-        OK "已存在，跳过：$(Split-Path -Leaf $Dest)"
-        return $true
-    }
-
-    $stall = 0; $round = 0
-    while ($round -lt 600) {
-        $round++
-        $have = if (Test-Path $Dest) { (Get-Item $Dest).Length } else { 0 }
-        if ($Expected -gt 0 -and $have -ge $Expected) { break }
-        if ($Expected -gt 0) {
-            Write-Host ("`r      下载中 ... {0,7:N1} / {1,7:N1} MB  (第 {2} 轮)" -f ($have / 1MB), ($Expected / 1MB), $round) -NoNewline
-        } else {
-            Write-Host ("`r      下载中 ... {0,7:N1} MB  (第 {1} 轮)" -f ($have / 1MB), $round) -NoNewline
-        }
-
-        & curl.exe -sS --ssl-no-revoke -L --max-time 30 -C - -o $Dest $Url 2>$null
-        $after = if (Test-Path $Dest) { (Get-Item $Dest).Length } else { 0 }
-
-        if ($after -gt $have) { $stall = 0 } else { $stall++; Start-Sleep -Seconds 2 }
-        if ($stall -ge 8) { Write-Host ""; Warn "连续 $stall 轮没有进展，放弃这个来源"; return $false }
-    }
-    Write-Host ""
-
-    $final = if (Test-Path $Dest) { (Get-Item $Dest).Length } else { 0 }
-    if ($Expected -gt 0 -and $final -ne $Expected) {
-        Warn "大小不对：期望 $Expected 字节，实际 $final 字节"
-        return $false
-    }
-    OK "$(Split-Path -Leaf $Dest)  ($([math]::Round($final / 1MB, 1)) MB)"
-    return $true
-}
-
-function Test-Sha256($Path, $Want) {
-    if (-not $Want) { return $true }
-    $got = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-    if ($got -eq $Want.ToUpper()) { OK "SHA-256 校验通过"; return $true }
-    Warn "SHA-256 不匹配！期望 $Want 实际 $got"
-    return $false
-}
+# 公共函数（Head / Step / OK / Info / Warn / Die / Ask-Yes / Get-File / Test-Sha256）
+# 放在 _公共.ps1 里，和 换模型.ps1 共用一套下载逻辑。
+. (Join-Path $PSScriptRoot "_公共.ps1")
 
 # ====================================================================
 Head "portable-ai-usb  ·  U盘组装"
@@ -272,11 +211,27 @@ foreach ($name in $want) {
             $spec = $Engines[$name]
             $zipList = if ($spec.Zips) { $spec.Zips } else { @($spec) }
 
-            # 尝试多个下载源（官方直连经常慢，镜像有时快）
-            $mirrors = @("", "https://gh-proxy.com/", "https://ghproxy.net/")
             foreach ($z in $zipList) {
-                $got = $false
                 $localZip = Join-Path $dlDir $z.Zip
+                if (Test-Path $localZip) { continue }
+
+                # 下之前先对一遍账：脚本里写死的大小会过期（上游重传一次资产就变了），
+                # 而「大小不对」原本要等整个文件下完才报。HEAD 一秒就返回，能省掉白等。
+                $remote = Get-RemoteSize "$LlamaBase/$($z.Zip)"
+                if ($remote -gt 0 -and $remote -ne $z.Size) {
+                    Write-Host ""
+                    Warn "$($z.Zip) 的大小和脚本里记的不一样："
+                    Warn "  脚本里记的：$($z.Size) 字节"
+                    Warn "  GitHub 现在：$remote 字节"
+                    Warn "多半是上游重新上传过这个文件。继续下也能下完，但随后的 SHA-256 校验大概率会失败。"
+                    Warn "正确的做法：按本脚本顶部注释里的那行命令重新取一遍大小和 digest，更新 $Engines 之后再来。"
+                    Write-Host ""
+                    if (-not (Ask-Yes "仍然要尝试下载吗？" $false)) { Die "已停下 —— 先把脚本顶部的校验值更新掉。" }
+                }
+
+                # 尝试多个下载源（官方直连经常慢，镜像有时快）
+                $mirrors = @("", "https://gh-proxy.com/", "https://ghproxy.net/")
+                $got = $false
                 foreach ($m in $mirrors) {
                     if ($got) { break }
                     Info "来源：$(if($m){$m}else{'github.com 直连'})"

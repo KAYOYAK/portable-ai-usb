@@ -182,10 +182,24 @@ if (-not $model) {
     $source = "自动（体积最大）"
 }
 
+# ---------------- 1.5 多模态投影文件（视觉能力）----------------
+# 引擎自己有 --mmproj-auto（默认开），但官方说明是"配合 -hf 拉远端模型时有用"；
+# 本盘用 -m 指定本地文件，自动检测不会生效。更要紧的是，引擎在找不到投影文件时
+# 有"自动下载"的路径 —— 那会联网，直接违背"零联网"承诺。
+# 所以这里两条路都写死：找到就显式指过去，没找到就显式关掉，不给引擎自己决定的机会。
+$mmproj = @(Get-ChildItem $DirModels -Filter "mmproj-*.gguf" -File -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending)
+if ($mmproj.Count -gt 0) { $mmproj = $mmproj[0] } else { $mmproj = $null }
+
 $modelGB = [math]::Round($model.Length / 1GB, 2)
 $alias   = [IO.Path]::GetFileNameWithoutExtension($model.Name)
 Write-Host "  模型     : $($model.Name)" -ForegroundColor Green
 Write-Host "  模型大小 : $modelGB GB"
+if ($mmproj) {
+    Write-Host "  视觉能力 :  开  ($($mmproj.Name))" -ForegroundColor Green
+} else {
+    Write-Host "  视觉能力 :  关  (models\ 里没有 mmproj-*.gguf)" -ForegroundColor DarkGray
+}
 if ($allModels.Count -gt 1) {
     Write-Host "  选择依据 : $source" -ForegroundColor DarkGray
     Write-Host "  可选模型 :" -ForegroundColor DarkGray
@@ -676,6 +690,11 @@ if ($backend -ne "cpu") {
 }
 if ($LoadMode -ne "auto") {
     $llamaArgs += @("-lm", $LoadMode)
+}
+if ($mmproj) {
+    $llamaArgs += @("-mm", $mmproj.FullName)
+} else {
+    $llamaArgs += @("--no-mmproj")
 }
 
 Write-Host ""
