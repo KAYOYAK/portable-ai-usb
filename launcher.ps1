@@ -41,7 +41,14 @@ $Root = $Root.TrimEnd('\')
 $DirModels = Join-Path $Root "models"
 $DirLlama  = Join-Path $Root "llama.cpp"
 $DirLog    = Join-Path $Root "logs"
-if (-not (Test-Path $DirLog)) { New-Item -ItemType Directory -Force -Path $DirLog | Out-Null }
+# 写保护的 U 盘 / 只读挂载的盘上建不出目录。日志只是附带品，
+# 不该因为写不进日志就让启动器死在第一屏 —— 建不出来就退回系统临时目录。
+try {
+    if (-not (Test-Path $DirLog)) { New-Item -ItemType Directory -Force -Path $DirLog | Out-Null }
+} catch {
+    $DirLog = Join-Path $env:TEMP "portable-ai-usb-logs"
+    if (-not (Test-Path $DirLog)) { New-Item -ItemType Directory -Force -Path $DirLog | Out-Null }
+}
 
 function Head($t) {
     Write-Host ""
@@ -275,7 +282,7 @@ public static class PsRawDisk
 function Measure-DiskReadRaw {
     param([string]$Path)
 
-    $r = [ordered]@{ SeqMBps = 0.0; RandIOPS = 0; RandMBps = 0.0; Samples = @(); Error = $null; Raw = $true }
+    $r = [ordered]@{ SeqMBps = 0.0; RandIOPS = 0; RandMBps = 0.0; Samples = @(); Error = $null; Raw = $true; Truncated = $false }
     $h = $null; $rawSeq = [IntPtr]::Zero; $bufSeq = [IntPtr]::Zero
     $rawBlk = [IntPtr]::Zero; $bufBlk = [IntPtr]::Zero
     try {
@@ -307,6 +314,10 @@ function Measure-DiskReadRaw {
                     $n = [PsRawDisk]::Read($h, $bufSeq, [math]::Min(1MB, $want - $got))
                     if ($n -le 0) { break }
                     $got += $n
+                    # 时间闸：这一段只是启动前给用户一句"大概要等多久"，不该在慢盘上
+                    # 反过来让人多等十几秒。3 秒到点就用手上已读到的字节数算均值 ——
+                    # 读了多少、花了多久都还是真数，只是样本小一点。
+                    if ($sw.Elapsed.TotalSeconds -gt 3.0) { $r.Truncated = $true; break }
                 }
                 $sw.Stop()
                 $sec = $sw.Elapsed.TotalSeconds
@@ -329,16 +340,21 @@ function Measure-DiskReadRaw {
             $span   = $len - $base - 4096
             $sw2    = [System.Diagnostics.Stopwatch]::StartNew()
             $miss   = 0
+            $done   = 0
             for ($i = 0; $i -lt 128; $i++) {
+                # 时间闸同上：慢盘上这 128 次随机读能拖到十几秒。到点就用已完成的次数
+                # 折算 IOPS —— 完成几次、花了多久都是真数，只是样本小一点。
+                if ($sw2.Elapsed.TotalSeconds -gt 1.5) { $r.Truncated = $true; break }
                 $pos = $base + [long](($rnd2.NextDouble() * $span) / 4096) * 4096
                 if ([PsRawDisk]::Seek($h, $pos) -lt 0) { break }
                 if ([PsRawDisk]::Read($h, $bufBlk, 4096) -lt 0) { $miss++ }
+                $done++
             }
             $sw2.Stop()
             $sec = $sw2.Elapsed.TotalSeconds
-            if ($sec -gt 0 -and $miss -eq 0) {
-                $r.RandIOPS = [math]::Round(128 / $sec, 0)
-                $r.RandMBps = [math]::Round((128 * 4KB / 1MB) / $sec, 2)
+            if ($sec -gt 0 -and $done -gt 0 -and $miss -eq 0) {
+                $r.RandIOPS = [math]::Round($done / $sec, 0)
+                $r.RandMBps = [math]::Round(($done * 4KB / 1MB) / $sec, 2)
             }
         }
     } catch {
@@ -346,8 +362,13 @@ function Measure-DiskReadRaw {
         $r.SeqMBps = 0.0
     } finally {
         if ($h) { $h.Dispose() }
-        [PsRawDisk]::Free($rawSeq)
-        [PsRawDisk]::Free($rawBlk)
+        # Add-Type 失败时 [PsRawDisk] 这个类型根本不存在，这时直接调 Free 会再抛一个
+        # "找不到类型 PsRawDisk"，把真正的错误盖掉，而且这个函数永远返回不到 ——
+        # 调用方本该看到的"退回带缓冲读"就再也不会发生。
+        if ("PsRawDisk" -as [type]) {
+            [PsRawDisk]::Free($rawSeq)
+            [PsRawDisk]::Free($rawBlk)
+        }
     }
     return $r
 }
@@ -359,7 +380,7 @@ function Measure-DiskReadRaw {
 function Measure-DiskReadBuffered {
     param([string]$Path)
 
-    $r = [ordered]@{ SeqMBps = 0.0; RandIOPS = 0; RandMBps = 0.0; Samples = @(); Error = $null; Raw = $false }
+    $r = [ordered]@{ SeqMBps = 0.0; RandIOPS = 0; RandMBps = 0.0; Samples = @(); Error = $null; Raw = $false; Truncated = $false }
     $fs = $null
     try {
         $fs  = [System.IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
@@ -400,15 +421,18 @@ function Measure-DiskReadBuffered {
             $base = 64MB
             $span = $len - $base - $blk.Length
             $sw2  = [System.Diagnostics.Stopwatch]::StartNew()
+            $done = 0
             for ($i = 0; $i -lt 128; $i++) {
+                if ($sw2.Elapsed.TotalSeconds -gt 1.5) { $r.Truncated = $true; break }
                 $fs.Position = $base + [long]($rnd.NextDouble() * $span)
                 [void]$fs.Read($blk, 0, $blk.Length)
+                $done++
             }
             $sw2.Stop()
             $sec = $sw2.Elapsed.TotalSeconds
-            if ($sec -gt 0) {
-                $r.RandIOPS = [math]::Round(128 / $sec, 0)
-                $r.RandMBps = [math]::Round((128 * 4KB / 1MB) / $sec, 2)
+            if ($sec -gt 0 -and $done -gt 0) {
+                $r.RandIOPS = [math]::Round($done / $sec, 0)
+                $r.RandMBps = [math]::Round(($done * 4KB / 1MB) / $sec, 2)
             }
         }
     } catch {
@@ -468,6 +492,9 @@ function Show-DiskReport {
     if ($Disk.Raw) {
         Write-Host "    （绕过系统缓存的实测值，就是这支盘的本事）" -ForegroundColor DarkGray
     }
+    if ($Disk.Truncated) {
+        Write-Host "    （这支盘慢，测到时间上限就收工了 —— 数字取自已经读完的那部分，够估时间）" -ForegroundColor DarkGray
+    }
     if ($cached) {
         Write-Host ""
         Write-Host "    这份模型已经被系统缓存过，上面的数字来自内存，不是这支盘的本事。" -ForegroundColor Yellow
@@ -503,7 +530,7 @@ function Show-DiskReport {
 if ($Bench) {
     Head "测一下这支 U 盘的速度"
     Write-Host "  测试文件 : $($model.Name)  ($modelGB GB)"
-    Write-Host "  读 2×32 MB 顺序 + 128 次随机 4K，几秒钟"
+    Write-Host "  绕过系统缓存真读一遍，最多几秒（盘特别慢会提前收工）"
     Write-Host "  （绕过系统缓存读，测的是这支盘本身）" -ForegroundColor DarkGray
     $d = Measure-DiskRead -Path $model.FullName
     Show-DiskReport -Disk $d -EstSec (Get-EstimateSeconds -Disk $d -ModelBytes $model.Length) -ModelGB $modelGB
@@ -774,6 +801,12 @@ if (Test-PortBusy $Port) {
     }
     Write-Host "         已自动改用端口 $Port。" -ForegroundColor Green
 }
+
+# 把最终端口落盘。高级选项.bat 的 [8]「打开 AI 网页界面」靠它找地址：
+# 端口被占用时启动器会自动换号，菜单那边不可能猜得到。
+try {
+    [System.IO.File]::WriteAllText((Join-Path $DirLog "端口.txt"), "$Port`r`n", (New-Object System.Text.UTF8Encoding $false))
+} catch { }
 
 # ---------------- 8. 启动 ----------------
 $log = Join-Path $DirLog ("server-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")

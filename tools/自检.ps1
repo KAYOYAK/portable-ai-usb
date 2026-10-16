@@ -41,15 +41,39 @@ foreach ($f in $need) {
 # 模型
 $dirModels = Join-Path $Root "models"
 $models = @()
+$mmprojFiles = @()
 if (Test-Path $dirModels) {
-    $models = @(Get-ChildItem $dirModels -Filter "*.gguf" -File -ErrorAction SilentlyContinue)
+    # mmproj-*.gguf 是视觉投影文件、不是模型本体，必须排除 ——
+    # 启动器就是这么排除的。两边不一致的话，下面拿 $models[0] 得出的内存结论就是错的。
+    # 同时按体积倒序：启动器默认挑最大的那个，这里必须和它选同一个。
+    $mmprojFiles = @(Get-ChildItem $dirModels -Filter "mmproj-*.gguf" -File -ErrorAction SilentlyContinue)
+    $models = @(Get-ChildItem $dirModels -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike "mmproj-*" } |
+                Sort-Object Length -Descending)
 }
+$pickFile = Join-Path $dirModels "当前模型.txt"
+$pickName = ""
+if (Test-Path $pickFile) {
+    $pickName = (Get-Content $pickFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+    if ($pickName) { $pickName = $pickName.Trim() } else { $pickName = "" }
+}
+# 启动器会优先用 当前模型.txt 指定的那个；没指定才用体积最大的。
+$defaultModel = $null
+if ($pickName) { $defaultModel = $models | Where-Object { $_.Name -eq $pickName } | Select-Object -First 1 }
+if (-not $defaultModel -and $models.Count -gt 0) { $defaultModel = $models[0] }
+
 if ($models.Count -gt 0) {
-    foreach ($m in $models) { P ("模型 {0}  ({1:N2} GB)" -f $m.Name, ($m.Length / 1GB)) }
-    if ($models.Count -gt 1) {
-        I "有 $($models.Count) 个模型，默认用最大的那个（要换用「高级选项.bat」的 [10]）"
+    foreach ($m in $models) {
+        $mark = if ($defaultModel -and $m.Name -eq $defaultModel.Name) { "   <- 启动时用这个" } else { "" }
+        P ("模型 {0}  ({1:N2} GB){2}" -f $m.Name, ($m.Length / 1GB), $mark)
+    }
+    if ($pickName -and -not ($models | Where-Object { $_.Name -eq $pickName })) {
+        W "当前模型.txt 写的是「$pickName」，但 models\ 里没有这个文件 —— 会退回用最大的那个"
     }
 } else { F "models\ 里没有 .gguf 模型" }
+if ($mmprojFiles.Count -gt 0) {
+    I ("视觉投影 {0}  ({1:N2} GB) —— 启动时会自动打开视觉能力" -f $mmprojFiles[0].Name, ($mmprojFiles[0].Length / 1GB))
+}
 
 # 引擎
 $runtimeDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll")
@@ -111,7 +135,7 @@ try { $gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name
 I "CPU $cores 核 / 内存 $ramGB GB"
 foreach ($g in $gpus) { I "显卡 $g" }
 
-$modelGB = if ($models.Count -gt 0) { [math]::Round($models[0].Length / 1GB, 2) } else { 0 }
+$modelGB = if ($defaultModel) { [math]::Round($defaultModel.Length / 1GB, 2) } else { 0 }
 if ($modelGB -gt 0 -and $ramGB -gt 0) {
     if ($ramGB -ge ($modelGB + 1.5)) { P "内存充足（模型 $modelGB GB）" }
     elseif ($ramGB -ge $modelGB)     { W "内存偏紧：模型 $modelGB GB / 内存 $ramGB GB —— 会走 mmap 换页，速度会掉" }

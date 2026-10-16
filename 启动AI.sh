@@ -24,6 +24,8 @@ SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SELF_DIR"
 DIR_MODELS="$ROOT/models"
 DIR_LLAMA="$ROOT/llama.cpp"
+DIR_LOG="$ROOT/logs"
+PORT_FILE="$DIR_LOG/端口.txt"
 
 PORT=8080
 CTX=""
@@ -115,11 +117,36 @@ while [ $# -gt 0 ]; do
         --probe)      DO_PROBE=1 ;;
         --bench)      DO_BENCH=1 ;;
         --stop)       DO_STOP=1 ;;
-        --model)      shift; MODEL_NAME="${1:-}" ;;
-        --ctx)        shift; CTX="${1:-}" ;;
-        --ngl)        shift; NGL="${1:-}" ;;
-        --port)       shift; PORT="${1:-}" ;;
-        --load-mode)  shift; LOAD_MODE="${1:-}" ;;
+        --model)      shift
+                      case "${1:-}" in
+                          "")   err "--model 后面要跟模型名"; printf '\n'; show_help; exit 1 ;;
+                          --*)  err "--model 后面要跟模型名，不是选项：$1"; printf '\n'; show_help; exit 1 ;;
+                      esac
+                      MODEL_NAME="$1" ;;
+        --ctx)        shift
+                      case "${1:-}" in
+                          ""|*[!0-9]*) err "--ctx 要一个正整数（token 数），收到「${1:-}」"; exit 1 ;;
+                      esac
+                      CTX="$1" ;;
+        --ngl)        shift
+                      case "${1:-}" in
+                          ""|*[!0-9]*) err "--ngl 要一个 0 或正整数（卸载层数），收到「${1:-}」"; exit 1 ;;
+                      esac
+                      NGL="$1" ;;
+        --port)       shift
+                      case "${1:-}" in
+                          ""|*[!0-9]*) err "--port 要一个端口号，收到「${1:-}」"; exit 1 ;;
+                      esac
+                      if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then
+                          err "--port 要在 1~65535 之间，收到「$1」"; exit 1
+                      fi
+                      PORT="$1" ;;
+        --load-mode)  shift
+                      case "${1:-}" in
+                          auto|mmap|none|mlock|mmap+mlock|dio) LOAD_MODE="$1" ;;
+                          *) err "--load-mode 只能是 auto / mmap / none / mlock / mmap+mlock / dio，收到「${1:-}」"
+                             exit 1 ;;
+                      esac ;;
         --no-browser) OPEN_BROWSER=0 ;;
         -h|--help)    show_help; exit 0 ;;
         *)            err "不认识的选项：$1"; printf '\n'; show_help; exit 1 ;;
@@ -150,7 +177,10 @@ esac
 # ---------------------------------------------------------------- 找引擎
 find_engine() {
     for name in $ENGINE_CANDIDATES; do
-        if [ -x "$DIR_LLAMA/$name/llama-server" ]; then
+        # 用 -f 不用 -x：U 盘多半是 exFAT / FAT32，这类文件系统没有可执行位，
+        # 挂载参数不同会给成 0644 或 0755 —— 拿 -x 判，会把已经拷好的引擎判成"没有"，
+        # 然后让人白下一遍。真没有执行权限时，启动那一步会给出具体提示。
+        if [ -f "$DIR_LLAMA/$name/llama-server" ]; then
             printf '%s\n' "$DIR_LLAMA/$name/llama-server"; return 0
         fi
     done
@@ -235,14 +265,25 @@ show_models() {
 #   2 = 一个都没命中，stdout 为空
 resolve_model() {
     want="$1"
-    hits="$(list_models | grep -Fx -- "$want" 2>/dev/null || true)"
+    # 比的是**文件名**，不是路径。
+    # list_models 吐出来的是绝对路径，直接 `grep -Fx "$want"` 拿裸文件名去比永远不中；
+    # 而子串那一档如果拿整条路径去比，盘路径里碰巧出现 "ai"、"tmp" 就会静默选中某个模型。
+    # 所以先把每个候选剥成 basename 再比 —— 和 Windows 那份（比 $_.Name）对齐。
+    # 三档都按大小写不敏感比，也对齐 PowerShell 的 -eq / OrdinalIgnoreCase。
+    lwant="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+
+    # ①②档：完整文件名 / 补 .gguf 后完整文件名
+    hits="$(list_models | while IFS= read -r l; do
+                lb="$(basename "$l" | tr '[:upper:]' '[:lower:]')"
+                if [ "$lb" = "$lwant" ] || [ "$lb" = "$lwant.gguf" ]; then
+                    printf '%s\n' "$l"
+                fi
+            done)"
+    # ③档：子串，只有唯一命中才算数
     if [ -z "$hits" ]; then
-        hits="$(list_models | grep -Fx -- "$want.gguf" 2>/dev/null || true)"
-    fi
-    if [ -z "$hits" ]; then
-        lwant="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
         hits="$(list_models | while IFS= read -r l; do
-                    case "$(printf '%s' "$l" | tr '[:upper:]' '[:lower:]')" in
+                    lb="$(basename "$l" | tr '[:upper:]' '[:lower:]')"
+                    case "$lb" in
                         *"$lwant"*) printf '%s\n' "$l" ;;
                     esac
                 done)"
@@ -270,8 +311,11 @@ do_stop() {
         info "ps aux | grep llama-server"
         return 1
     fi
-    # 只认"本盘路径"下跑起来的，别的程序起的 llama-server 不碰
-    pids="$(pgrep -f "$DIR_LLAMA.*llama-server" 2>/dev/null || true)"
+    # 只认"本盘路径"下跑起来的，别的程序起的 llama-server 不碰。
+    # 盘路径要先转义再拼进正则：路径里的 . + [ ( 这些本来就是正则元字符，
+    # /Volumes/AI.1 会连 /Volumes/AIx1 一起匹配上，那就可能误伤别的盘的进程。
+    esc_dir="$(printf '%s' "$DIR_LLAMA" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+    pids="$(pgrep -f "$esc_dir.*llama-server" 2>/dev/null || true)"
     killed=0
     for p in $pids; do
         if kill "$p" 2>/dev/null; then
@@ -290,8 +334,10 @@ head_line "U盘 AI 便携版  ·  llama.cpp   （$PLATFORM_OS / $ARCH）"
 printf '  启动位置 : %s\n' "$ROOT"
 
 if [ "$DO_STOP" = 1 ]; then
+    # 把返回码透出去：没有 pgrep 的机器上啥也没停成，不能还报 0。
+    # （"本来就没有在跑"那一支仍是 0 —— 那种情况停止是幂等的，不算失败。）
     do_stop
-    exit 0
+    exit $?
 fi
 
 if [ ! -d "$DIR_MODELS" ]; then
@@ -322,7 +368,9 @@ if [ -n "$MODEL_NAME" ]; then
            printf '\n'; show_models; pause_enter; exit 1 ;;
     esac
 elif [ -f "$DIR_MODELS/当前模型.txt" ]; then
-    want="$(tr -d '\r\n' < "$DIR_MODELS/当前模型.txt")"
+    # 清掉 BOM、行尾和首尾空白再比。手工用记事本"另存为 UTF-8"会带上 BOM，
+    # 手滑多敲一个空格也很常见 —— 脏串会让匹配整个偏掉，而用户看不出为什么。
+    want="$(tr -d '\357\273\277\r\n' < "$DIR_MODELS/当前模型.txt" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     if [ -n "$want" ]; then
         out="$(resolve_model "$want")"; rc=$?
         if [ "$rc" -eq 0 ]; then
@@ -330,6 +378,8 @@ elif [ -f "$DIR_MODELS/当前模型.txt" ]; then
         else
             warn "当前模型.txt 里写的「$want」没法唯一确定，改回自动选最大的。"
         fi
+    else
+        warn "当前模型.txt 是空的，按体积最大的选。"
     fi
 fi
 
@@ -348,6 +398,12 @@ fi
 MODEL_BASE="$(basename "$MODEL")"
 MODEL_ALIAS="${MODEL_BASE%.gguf}"
 MODEL_BYTES="$(file_bytes "$MODEL")"
+# 读不到就按 0 处理并说一声：这个数下面要参与测速折算和内存判断，
+# 留空会让算术里静默按 0 走，反而不如明说。
+if [ -z "$MODEL_BYTES" ]; then
+    MODEL_BYTES=0
+    warn "读不到模型文件的大小（权限或介质问题？）—— 下面按 0 处理。"
+fi
 MODEL_HUMAN="$(human "$MODEL_BYTES")"
 
 printf '  模型     : %s%s%s  (%s)\n' "$C_OK" "$MODEL_BASE" "$C_OFF" "$SOURCE"
@@ -359,7 +415,11 @@ printf '  模型大小 : %s\n' "$MODEL_HUMAN"
 # 而这个盘的卖点之一就是首次启动完全离线。
 MMPROJ=""
 if [ -d "$DIR_MODELS" ]; then
-    MMPROJ="$(find "$DIR_MODELS" -maxdepth 1 -name 'mmproj-*.gguf' -type f 2>/dev/null | head -1)"
+    # 取体积最大的那个，和 Windows 那份一致（launcher.ps1 按体积降序取第一个）。
+    # 原来是 find | head -1，拿的是 find 遍历顺序里碰巧排最前的那个 ——
+    # 盘里同时放着 f16 和 q4_0 两份投影文件时，会挑到小的那份。
+    MMPROJ="$(ls -S "$DIR_MODELS"/mmproj-*.gguf 2>/dev/null | head -1)"
+    [ -f "$MMPROJ" ] || MMPROJ=""
 fi
 if [ -n "$MMPROJ" ]; then
     printf '  看图能力 : %s开%s  (%s)\n' "$C_OK" "$C_OFF" "$(basename "$MMPROJ")"
@@ -410,6 +470,11 @@ KV_TYPE="q8_0"
 if [ "$RAM_GB" -gt 0 ] 2>/dev/null && [ "$RAM_GB" -lt 12 ] 2>/dev/null; then
     KV_TYPE="q4_0"
 fi
+# 真正传给引擎的 KV 量化，和上面"打算用哪种"是两件事：
+# --cache-type-* 只有 vulkan / cuda 那两份引擎带，macOS 走 Metal 不传。
+# 显示的时候必须看这个，否则会在 Mac 上打出"KV 缓存 q4_0"而实际没生效 —— 
+# 那种"看着省了内存其实没省"的误导比不显示更糟。
+KV_SHOWN=""
 
 # ---- 拼参数 ----
 set -- \
@@ -426,7 +491,9 @@ set -- \
 
 # 只有 vulkan/cuda 那两份引擎才有这两个开关；macOS 的 Metal 交给引擎自己定
 case "$ENGINE" in
-    *vulkan*|*cuda*) set -- "$@" --flash-attn on --cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE" ;;
+    *vulkan*|*cuda*)
+        set -- "$@" --flash-attn on --cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE"
+        KV_SHOWN="$KV_TYPE" ;;
 esac
 
 LOAD_NOTE=""
@@ -452,7 +519,11 @@ fi
 printf '\n'
 printf '  %s上下文   : %s tokens%s\n' "$C_DIM" "$CTX" "$C_OFF"
 printf '  显存卸载 : %s 层\n' "$NGL"
-printf '  KV 缓存  : %s\n' "$KV_TYPE"
+if [ -n "$KV_SHOWN" ]; then
+    printf '  KV 缓存  : %s\n' "$KV_SHOWN"
+else
+    printf '  KV 缓存  : %s\n' "引擎默认（这份引擎不接受这个开关）"
+fi
 printf '  CPU 线程 : %s  (本机 %s 核)\n' "$THREADS" "$CPU_CORES"
 printf '  内存     : %s GB\n' "$RAM_GB"
 [ "$LOAD_MODE" != "auto" ] && printf '  加载方式 : %s %s\n' "$LOAD_MODE" "$LOAD_NOTE"
@@ -460,7 +531,7 @@ printf '  内存     : %s GB\n' "$RAM_GB"
 if [ "$DO_PROBE" = 1 ]; then
     head_line "探测完成（没有真的启动引擎）"
     printf '  模型  = %s\n' "$MODEL_BASE"
-    printf '  ctx   = %s        ngl = %s        kv = %s\n' "$CTX" "$NGL" "$KV_TYPE"
+    printf '  ctx   = %s        ngl = %s        kv = %s\n' "$CTX" "$NGL" "${KV_SHOWN:-默认}"
     printf '  内存  = %s GB     线程 = %s\n' "$RAM_GB" "$THREADS"
     exit 0
 fi
@@ -469,21 +540,39 @@ fi
 # 说明：这里测的是「接近真实」的顺序读，不声称绕过了系统缓存 ——
 # 真要绕过得自己写 O_DIRECT，为它引一堆代码不值得。缓存命中时会明确说出来。
 if [ "$DO_BENCH" = 1 ]; then
+    # 每段读 32 MB，但模型文件可能比这小得多 —— 这时 dd 会提前 EOF，
+    # 而按 32 MB 折算速度就会报出"6 MB 的模型读 431 MB/s"这种假数。
+    # 所以每段实际读多少先算出来，速度按真正读到的量算；实在太小就直说测不了。
+    usable_mb=$(( MODEL_BYTES / 1048576 ))
+    if [ "$usable_mb" -lt 32 ]; then
+        warn "模型只有 ${usable_mb} MB，太小了，测不出这支盘的速度。"
+        info "盘上放一个几百 MB 以上的模型再测；或者用 Windows 那份启动器的 [11]（它按字节真读）。"
+        pause_enter; exit 0
+    fi
     step=0
     total=0
-    printf '\n  正在读 3 段，每段 32 MB……\n'
+    printf '\n  正在读 3 段，每段最多 32 MB……\n'
     for frac in 20 55 80; do
-        skip_mb=$(( MODEL_BYTES / 1048576 * frac / 100 ))
+        off_mb=$(( usable_mb * frac / 100 ))
+        left_mb=$(( usable_mb - off_mb ))
+        this_mb=32
+        if [ "$this_mb" -gt "$left_mb" ]; then this_mb="$left_mb"; fi
+        # 段太小时读出来的是抖动，不是速度 —— 跳过，别拿它凑平均
+        if [ "$this_mb" -lt 8 ]; then continue; fi
         t0="$(now_ms)"
-        dd if="$MODEL" of=/dev/null bs=1048576 count=32 skip="$skip_mb" 2>/dev/null || true
+        dd if="$MODEL" of=/dev/null bs=1048576 count="$this_mb" skip="$off_mb" 2>/dev/null || true
         t1="$(now_ms)"
         ms=$(( t1 - t0 ))
         [ "$ms" -gt 0 ] || ms=1
-        mbps=$(( 32 * 1000 / ms ))
+        mbps=$(( this_mb * 1000 / ms ))
         step=$((step+1)); total=$((total+mbps))
-        printf '        第%s段   %s MB/s\n' "$step" "$mbps"
+        printf '        第%s段   %s MB/s   （读 %s MB）\n' "$step" "$mbps" "$this_mb"
     done
-    avg=$(( total / 3 ))
+    if [ "$step" -eq 0 ]; then
+        warn "三段都太小，算不出可信的速度。"
+        pause_enter; exit 0
+    fi
+    avg=$(( total / step ))
     printf '\n'
     if [ "$avg" -ge 1500 ]; then
         warn "读数 ${avg} MB/s —— 这是内存缓存的速度，不是这支盘的真实速度。"
@@ -503,19 +592,42 @@ if [ "$DO_BENCH" = 1 ]; then
 fi
 
 # ---- 端口 ----
+# 判占用依次退让：lsof 最准；没有就用 nc 探；再没有就用 curl 敲一下 HTTP。
+# 三样都没有的机器上判不出来，按"空闲"处理 —— 让引擎自己去撞，总比把用户拦在门口强。
 port_busy() {
     if command -v lsof >/dev/null 2>&1; then
         lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    elif command -v nc >/dev/null 2>&1; then
+        nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+    elif command -v curl >/dev/null 2>&1; then
+        curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$1/" 2>/dev/null
     else
         return 1
     fi
 }
 if port_busy "$PORT"; then
-    err "端口 $PORT 已经被占用了"
-    info "换一个： bash 启动AI.sh --port 8081"
-    info "或先停掉占着的： bash 启动AI.sh --stop"
-    pause_enter; exit 1
+    # 和 Windows 那份启动器保持一致：被占就往后退，不把用户拦在门口。
+    # docs/常见问题.md「端口已被占用」一节写的也是这个行为。
+    pf_want="$PORT"; pf_try=""
+    pf_n=1
+    while [ "$pf_n" -le 20 ]; do
+        pf_guess=$((pf_want + pf_n))
+        if ! port_busy "$pf_guess"; then pf_try="$pf_guess"; break; fi
+        pf_n=$((pf_n + 1))
+    done
+    if [ -z "$pf_try" ]; then
+        err "端口 $pf_want ~ $((pf_want + 20)) 全被占用了，起不来。"
+        info "先腾一个出来，或者换一段： bash 启动AI.sh --port 9000"
+        pause_enter; exit 1
+    fi
+    warn "端口 $pf_want 被别的程序占用了，改用 $pf_try。"
+    PORT="$pf_try"
 fi
+
+# 把最终端口落盘。Windows 那边「高级选项.bat [8] 打开 AI 网页界面」靠这个文件找地址 ——
+# 端口被占时启动器会自动换号，菜单那边猜不到，只能由这里写出来。
+mkdir -p "$DIR_LOG" 2>/dev/null || true
+printf '%s\n' "$PORT" > "$PORT_FILE" 2>/dev/null || true
 
 # ---- 起 ----
 URL="http://127.0.0.1:$PORT"
@@ -526,11 +638,20 @@ printf '\n'
 
 if [ "$OPEN_BROWSER" = 1 ]; then
     (
+        # 这个看守是"孤儿候选"：下面的 exec 会把启动器进程整个换成引擎，
+        # shell 级的 EXIT trap 随之消失，没有人管得到这个子 shell。
+        # 所以它得自己认死 —— 主进程没了就收工。否则引擎崩掉之后，它还可能在
+        # 最多 300 秒里把浏览器弹到**别人的**服务上。
+        # 用 $$ 而不是 $PPID：子 shell 里 $$ 是主 shell 的 PID，而 exec 保持 PID 不变，
+        # 所以 $$ 正好是"启动器/引擎"那个进程。$PPID 指的是启动器的父进程（终端），认错人。
         i=0
         while [ "$i" -lt 300 ]; do
             i=$((i+1))
             sleep 1
-            if curl -s -o /dev/null --max-time 2 "$URL/health" 2>/dev/null; then
+            kill -0 "$$" 2>/dev/null || exit 0
+            # -f 让 4xx/5xx 也算失败：模型还在加载时 /health 返回 503，
+            # 不带 -f 的话那一刻就当成"就绪"，浏览器会开在一个还没准备好的服务上。
+            if curl -fsS -o /dev/null --max-time 2 "$URL/health" 2>/dev/null; then
                 case "$PLATFORM_OS" in
                     macos) open "$URL" >/dev/null 2>&1 ;;
                     linux) command -v xdg-open >/dev/null 2>&1 && xdg-open "$URL" >/dev/null 2>&1 ;;
@@ -542,4 +663,17 @@ if [ "$OPEN_BROWSER" = 1 ]; then
 fi
 
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT INT TERM
+
+# exFAT / FAT32 上没有可执行位，从 Windows 拷进去的引擎挂到 Linux 后常常没有 x。
+# 先自己补一次；补不了就说清原因，别让 exec 抛一句干巴巴的 Permission denied。
+if [ ! -x "$ENGINE" ]; then
+    chmod +x "$ENGINE" 2>/dev/null || true
+fi
+if [ ! -x "$ENGINE" ]; then
+    warn "引擎文件没有执行权限：$ENGINE"
+    info "试一下： chmod +x \"$ENGINE\""
+    info "如果改不动（盘是只读挂载的），重新挂载时带上 exec 选项再试。"
+    exit 1
+fi
+
 exec "$ENGINE" "$@"

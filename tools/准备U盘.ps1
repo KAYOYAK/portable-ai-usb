@@ -37,6 +37,19 @@ $LlamaBase  = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaTag
 $ModelRepo  = "https://hf-mirror.com/bartowski/MiMo-V2.6-Distill-Qwen-9B-GGUF/resolve/main"
 $ModelFile  = "MiMo-V2.6-Distill-Qwen-9B-$Quant.gguf"
 
+# 三个量化的真实大小与 SHA-256，取自 HuggingFace 的 LFS 元数据（文件自带的哈希），不是手抄的。
+#
+# 为什么必须校验哈希、不能只比大小：有的镜像会无视 Range 请求、把整个文件从头返回，
+# 续传拼出来的文件**大小完全正确、内容却是坏的**，只比大小根本拦不住。
+# 而一个下坏的模型比下不到更糟：它不会当场报错，会在启动或推理时抛奇怪的异常。
+$ModelMeta = @{
+    "Q4_K_M" = @{ Size = 5841049120; Sha = "4bca6f18c73f72270c7a20c2ea2bea581de8246e318714277120369d34048c81" }
+    "Q5_K_M" = @{ Size = 6876124704; Sha = "04cf46f2b5584ef922697d6c063f94879434fb86c467f1a09e52daf0cddaf35f" }
+    "Q8_0"   = @{ Size = 9545979424; Sha = "2fad0aa11bb9e7aa491ff12f768954f9dd0a6e7d4ce4a897ca73ec420f3b90ae" }
+}
+$ModelSize = $ModelMeta[$Quant].Size
+$ModelSha  = $ModelMeta[$Quant].Sha
+
 # 官方预编译包（含大小与 SHA-256，下完自动校验）
 #
 # 这些值取自 GitHub Release 的资产元数据。两份 cuda13 曾经只写了大小、没写哈希，
@@ -126,7 +139,7 @@ $needGB = 0
 if (-not $SkipCpu)    { $needGB += 0.06 }
 if (-not $SkipVulkan) { $needGB += 0.10 }
 if (-not $SkipCuda)   { $needGB += 0.75 }
-$needGB += @{ "Q4_K_M" = 5.5; "Q5_K_M" = 6.5; "Q8_0" = 9.0 }[$Quant]
+$needGB += [math]::Round($ModelSize / 1GB, 1)
 $needGB += 0.2
 if ($freeGB -gt 0 -and $freeGB -lt $needGB) { Die "可用空间不足：需要约 $needGB GB，只有 $freeGB GB" }
 if ($freeGB -gt 0) { OK "空间够（约需 $needGB GB）" }
@@ -213,7 +226,13 @@ foreach ($name in $want) {
 
             foreach ($z in $zipList) {
                 $localZip = Join-Path $dlDir $z.Zip
-                if (Test-Path $localZip) { continue }
+                # 暂存目录里可能躺着上一次没收完的半截包。先验，验不过就删掉重下 ——
+                # 「文件在就跳过」会让 Expand-Archive 在最后一步才失败，非常难查。
+                if (Test-Path $localZip) {
+                    if ((Get-Item $localZip).Length -eq $z.Size -and (Test-Sha256 $localZip $z.Sha)) { continue }
+                    Info "暂存里的 $($z.Zip) 不完整，删掉重下"
+                    Remove-Item $localZip -Force -ErrorAction SilentlyContinue
+                }
 
                 # 下之前先对一遍账：脚本里写死的大小会过期（上游重传一次资产就变了），
                 # 而「大小不对」原本要等整个文件下完才报。HEAD 一秒就返回，能省掉白等。
@@ -238,7 +257,12 @@ foreach ($name in $want) {
                     if (Get-File -Url "$m$LlamaBase/$($z.Zip)" -Dest $localZip -Expected $z.Size) { $got = $true }
                 }
                 if (-not $got) { Die "下载失败：$($z.Zip)。可以手动下载后放到 $dlDir 再重跑本脚本。" }
-                Test-Sha256 $localZip $z.Sha | Out-Null
+                # 校验结果必须当场处理。丢掉它，坏包会在下面 Expand-Archive 那一行
+                # 变成一句看不懂的解压错误 —— 离真正的原因隔了三层。
+                if (-not (Test-Sha256 $localZip $z.Sha)) {
+                    Remove-Item $localZip -Force -ErrorAction SilentlyContinue
+                    Die "$($z.Zip) 校验失败，坏包已删。重跑本脚本会重新下载。"
+                }
                 Info "解压 $($z.Zip)"
                 Expand-Archive -LiteralPath $localZip -DestinationPath $dst -Force
             }
@@ -285,20 +309,28 @@ if (Test-Path $modelDst) {
         } else { Warn "复制结果大小不对，改为下载" }
     }
     if (-not $ok) {
-        $localZip = Join-Path $Stash "model-$Quant.gguf.part"
+        # 用真实文件名做暂存名，避免不同量化之间串味；固定名会让换量化后接着下旧文件。
+        $modelTmp = Join-Path $Stash "$ModelFile.part"
         Info "来源：hf-mirror.com（HuggingFace 国内镜像）"
-        if (-not (Get-File -Url "$ModelRepo/$ModelFile" -Dest $localZip)) {
+        if (-not (Get-File -Url "$ModelRepo/$ModelFile" -Dest $modelTmp -Expected $ModelSize)) {
             Die "模型下载失败。可手动下载 $ModelFile 后放进 $dirModels 再重跑本脚本。"
         }
+        # 大小对不算数（镜像无视 Range 时会拼出大小对、内容坏的文件），必须验哈希。
+        if (-not (Test-Sha256 $modelTmp $ModelSha)) {
+            Remove-Item $modelTmp -Force -ErrorAction SilentlyContinue
+            Die "模型校验失败，坏文件已删。重跑本脚本会重新下载。"
+        }
         Info "搬到 U 盘 ..."
-        Move-Item $localZip $modelDst -Force
+        Move-Item $modelTmp $modelDst -Force
         OK "模型已就位"
     }
 }
 
 # ---------------- 6. 启动器 ----------------
 Step 6 "启动器文件"
-foreach ($f in @("launcher.ps1", "启动AI.bat", "高级选项.bat", "使用说明.txt")) {
+# 启动AI.sh 是给 macOS / Linux 用的。这支 U 盘插到 Mac 上也要能用，
+# 所以即使在 Windows 上组装，这一份也必须一起带上。
+foreach ($f in @("launcher.ps1", "启动AI.bat", "高级选项.bat", "启动AI.sh", "使用说明.txt")) {
     $s = Join-Path $Root $f
     if (Test-Path $s) { Copy-Item $s $Target -Force; OK $f }
     else { Warn "仓库里找不到 $f" }

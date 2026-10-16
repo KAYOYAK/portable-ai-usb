@@ -31,6 +31,24 @@ function Pause-Safe {
     try { Pause } catch { }
 }
 
+# 打开 AI 网页界面。端口不一定就是 8080 —— 启动器发现 8080 被别的程序占用时
+# 会自动往上换号，换完把结果写进 logs\端口.txt。这里优先读它，读不到才用默认值。
+function Open-WebUI {
+    $port = 8080
+    $f = Join-Path $Root 'logs\端口.txt'
+    if (Test-Path $f) {
+        $t = Get-Content $f -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        $n = 0
+        if ($t -and [int]::TryParse($t.Trim(), [ref]$n) -and $n -gt 0 -and $n -lt 65536) { $port = $n }
+    }
+    Write-Host ""
+    Write-Host "  正在打开 http://127.0.0.1:$port" -ForegroundColor Cyan
+    Write-Host "  （如果浏览器显示打不开，说明 AI 还没启动，先回去用 [1] 启动）" -ForegroundColor DarkGray
+    Write-Host ""
+    try { Start-Process "http://127.0.0.1:$port" } catch { Write-Host "  打不开浏览器：$($_.Exception.Message)" -ForegroundColor Red }
+    Pause-Safe
+}
+
 # 读一个选择。stdin 被重定向时（管道、计划任务、自动化测试）：
 #   PowerShell 5.1 的 Read-Host 会抛 "PowerShell 处于非交互模式"，
 #   在 $ErrorActionPreference="Stop" 下直接把整个脚本带走 —— 表现是菜单
@@ -181,7 +199,7 @@ while ($true) {
             Write-Host ""
             Pause-Safe
         }
-        "8" { Start-Process "http://127.0.0.1:8080" }
+        "8" { Clear-Safe; Open-WebUI }
         "9" {
             Clear-Safe
             if (Test-Path $SelfTest) { & $SelfTest } else { Write-Host "  [缺失] 找不到 $SelfTest" -ForegroundColor Red }

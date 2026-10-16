@@ -108,7 +108,10 @@ function Show-Installed {
     }
     $cur = Join-Path $dirModels "当前模型.txt"
     if (Test-Path $cur) {
-        $want = (Get-Content $cur -Raw -Encoding UTF8).Trim()
+        # 空文件是可能的（编辑器里新建过、或手工清空过）。Get-Content -Raw 对空文件
+        # 返回 $null，直接 .Trim() 会抛"不能对空值调用方法"，把整个脚本带走。
+        $want = Get-Content $cur -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($want) { $want = $want.Trim() } else { $want = "（文件是空的）" }
         Write-Host "  当前模型.txt 指定的是：$want" -ForegroundColor Cyan
     } else {
         Write-Host "  （没有 当前模型.txt，启动时自动用最大的那个）" -ForegroundColor DarkGray
@@ -194,9 +197,21 @@ if ($pick.N -eq $Mmproj.For) {
     if ($wantMmproj) { $need += $Mmproj.Size }
 }
 
-$drive  = (Get-Item $dirModels).PSDrive
-$driveN = if ($drive) { $drive.Name } else { "?" }
-$freeGB = if ($drive) { [math]::Round($drive.Free / 1GB, 2) } else { 0 }
+# 剩余空间。不要用 (Get-Item $dir).PSDrive —— PowerShell 6+ 的 Get-Item 不再附带
+# PSDrive / PSProvider 这两个注记属性，在 PowerShell 7 上拿到的是 $null，
+# 于是空间检查**静默失效**：磁盘满了也不拦，下到一半才失败。
+# 这里自己从路径取盘符，两种 PowerShell 上都成立。
+$driveN = "?"
+$freeGB = 0
+try {
+    $rootPath = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $dirModels).Path)
+    $letter = $rootPath.TrimEnd('\', '/').TrimEnd(':')
+    if ($letter -match '^[A-Za-z]$') {
+        $driveN = $letter
+        $psd = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
+        if ($psd -and $null -ne $psd.Free) { $freeGB = [math]::Round($psd.Free / 1GB, 2) }
+    }
+} catch { }
 Write-Host ""
 Info "需要下载 $("{0:N2}" -f ($need / 1GB)) GB，$driveN 盘剩余 $freeGB GB"
 if ($freeGB -gt 0 -and $freeGB -lt ($need / 1GB + 1.0)) {
@@ -221,11 +236,17 @@ $ok = Get-Model $Repo[$pick.N] $pickFile $pick.Size (Get-FullSha $pick) $pickFil
 
 if ($ok -and $wantMmproj) {
     Step 2 "下载投影文件（视觉能力）"
-    $ok = Get-Model $Mmproj.Repo $Mmproj.File $Mmproj.Size $Mmproj.Sha $Mmproj.File
-    if ($ok) { OK "以后启动时，启动器会自动认出它并打开视觉能力。" }
+    if (Get-Model $Mmproj.Repo $Mmproj.File $Mmproj.Size $Mmproj.Sha $Mmproj.File) {
+        OK "以后启动时，启动器会自动认出它并打开视觉能力。"
+    } else {
+        # 模型本体已经装好了，只是看图能力没装成。这里不能沿用 $ok ——
+        # 那会让下面报出"模型没下成功"，把一次成功的安装说成失败的。
+        Warn "投影文件没下成功。模型本体是好的，只是暂时不能看图。"
+        Warn "想要看图：重跑本脚本再选一次 4 号（模型已存在会自动跳过，只补投影文件）。"
+    }
 }
 
-if (-not $ok) { Die "没下成功，模型没装好。" }
+if (-not $ok) { Die "模型没下成功，磁盘上没留下完整文件。" }
 
 # ---------------- 设成默认 ----------------
 Step 3 "设为默认模型"

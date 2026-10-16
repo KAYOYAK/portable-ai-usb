@@ -58,9 +58,38 @@ function Get-File {
     $destDir = Split-Path -Parent $Dest
     if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
 
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        Warn "找不到 curl.exe（Windows 10 1803 以上自带）。换一台机器，或手动把文件放好。"
+        return $false
+    }
+
+    # 没给期望大小就问服务器要一个。
+    #
+    # 这一步不是"顺手校验"：下面那个 while 循环完全靠 $Expected 判断"下完了没有"。
+    # 缺了它，一次**成功**的下载会在文件不再增长之后被判成"连续无进展"，
+    # 撑满 8 轮之后返回 false —— 调用方于是把已经下好的文件当成失败。
+    # （踩过：准备U盘.ps1 下模型时没传 -Expected，干净机器上必然误报"模型下载失败"。）
+    if ($Expected -le 0) { $Expected = Get-RemoteSize $Url }
+
     if ($Expected -gt 0 -and (Test-Path $Dest) -and (Get-Item $Dest).Length -eq $Expected) {
         OK "已存在，跳过：$(Split-Path -Leaf $Dest)"
         return $true
+    }
+
+    # 服务器连大小都不给（分块传输等）：没有大小就没法安全续传，也没法判断是否下完。
+    # 这种情况只跑一次普通下载，用 curl 自己的退出码判定成败。
+    if ($Expected -le 0) {
+        Write-Host "      下载中 ...（服务器未提供大小）" -NoNewline
+        & curl.exe -sS --ssl-no-revoke -L --max-time 1800 -o $Dest $Url 2>$null
+        $code = $LASTEXITCODE
+        Write-Host ""
+        $got = if (Test-Path $Dest) { (Get-Item $Dest).Length } else { 0 }
+        if ($code -eq 0 -and $got -gt 0) {
+            OK "$(Split-Path -Leaf $Dest)  ($([math]::Round($got / 1MB, 1)) MB)"
+            return $true
+        }
+        Warn "下载失败：$(Split-Path -Leaf $Dest)（curl 退出码 $code，只收到 $got 字节）"
+        return $false
     }
 
     $stall = 0; $round = 0
