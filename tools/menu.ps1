@@ -49,6 +49,7 @@ function Show-Menu {
     Write-Host "    [7]  停止本 U 盘的 AI"
     Write-Host "    [8]  打开 AI 网页界面"
     Write-Host "    [9]  环境自检  (U盘文件是否齐全)"
+    Write-Host "    [10] 选择使用哪个模型  (models\ 下有多个时)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -58,6 +59,77 @@ function Show-Menu {
 function Invoke-Launcher {
     param([string[]]$ExtraArgs)
     & $Launcher @ExtraArgs
+}
+
+# [10] 换模型：把选择写进 models\当前模型.txt，launcher.ps1 下次读它。
+# 写纯文本而不是改脚本，是为了让 U 盘在只读介质、或用户没装编辑器的情况下也能换模型。
+function Select-Model {
+    Clear-Safe
+    $dirModels = Join-Path $Root 'models'
+    $pickFile  = Join-Path $dirModels '当前模型.txt'
+
+    Write-Host ""
+    Write-Host "  ============================================================"
+    Write-Host "    选择使用哪个模型"
+    Write-Host "  ============================================================"
+    Write-Host ""
+
+    if (-not (Test-Path $dirModels)) {
+        Write-Host "  [错误] 找不到 $dirModels" -ForegroundColor Red
+        Write-Host ""; Pause-Safe; return
+    }
+
+    $models = @(Get-ChildItem $dirModels -Filter '*.gguf' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike 'mmproj-*' } |
+                Sort-Object Length -Descending)
+    if ($models.Count -eq 0) {
+        Write-Host "  [错误] models\ 里没有 .gguf 模型文件" -ForegroundColor Red
+        Write-Host ""; Pause-Safe; return
+    }
+
+    $current = ''
+    if (Test-Path $pickFile) {
+        $current = Get-Content $pickFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($current) { $current = $current.Trim() }
+    }
+
+    for ($i = 0; $i -lt $models.Count; $i++) {
+        $mark = ''
+        if ($models[$i].Name -eq $current) { $mark = '   <- 当前' }
+        Write-Host ("    [{0}]  {1}   ({2:N2} GB){3}" -f ($i + 1), $models[$i].Name, ($models[$i].Length / 1GB), $mark)
+    }
+    Write-Host ""
+    Write-Host "    [a]  自动  (每次用体积最大的那个)"
+    Write-Host "    [0]  返回"
+    Write-Host ""
+    Write-Host "  ============================================================"
+
+    $sel = Read-Host "   请选择"
+    if ($null -eq $sel) { return }
+    $sel = $sel.Trim()
+
+    if ($sel -eq 'a' -or $sel -eq 'A') {
+        Remove-Item $pickFile -Force -ErrorAction SilentlyContinue
+        Write-Host ""
+        Write-Host "  已改为自动：下次启动用 models\ 里体积最大的模型。" -ForegroundColor Green
+        Write-Host ""; Pause-Safe; return
+    }
+
+    $idx = 0
+    if (-not [int]::TryParse($sel, [ref]$idx)) { return }
+    if ($idx -lt 1 -or $idx -gt $models.Count) { return }
+
+    $chosen = $models[$idx - 1]
+    try {
+        [System.IO.File]::WriteAllText($pickFile, $chosen.Name + "`r`n", (New-Object System.Text.UTF8Encoding $false))
+    } catch {
+        Write-Host "  [错误] 写不进 $pickFile ：$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host ""; Pause-Safe; return
+    }
+    Write-Host ""
+    Write-Host "  已选定：$($chosen.Name)" -ForegroundColor Green
+    Write-Host "  下次双击 启动AI.bat 就用它。" -ForegroundColor Green
+    Write-Host ""; Pause-Safe
 }
 
 if (-not (Test-Path $Launcher)) {
@@ -71,7 +143,7 @@ if (-not (Test-Path $Launcher)) {
 
 while ($true) {
     Show-Menu
-    $opt = Read-Host "   请选择 [0-9]"
+    $opt = Read-Host "   请选择"
     if ($null -eq $opt) { exit 0 }        # stdin 已关闭（非交互运行）时直接退出
     $opt = $opt.Trim()
 
@@ -99,6 +171,7 @@ while ($true) {
             Write-Host ""
             Pause-Safe
         }
+        "10" { Select-Model }
         "0" { exit 0 }
         "q" { exit 0 }
         default { }

@@ -16,6 +16,10 @@ param(
     [int]$Ctx          = 0,        # 0 = 按显存/内存自动
     [int]$Ngl          = -1,       # -1 = 自动
     [switch]$NoBrowser,
+    [string]$ModelName = "",       # 指定 models\ 里的哪个 .gguf；空 = 按约定自动选
+                                   # 坑：这个参数不能叫 $Model —— PowerShell 变量名大小写
+                                   # 不敏感，会和下面的 $model 变成同一个变量，[string]
+                                   # 的类型约束把 FileInfo 强转成字符串，.Name/.FullName 全空。
     [switch]$Probe,                # 只探测环境，不启动
     [switch]$Stop                  # 只停掉"本 U 盘"启动的引擎
 )
@@ -79,14 +83,58 @@ Head "U盘 AI 便携版  ·  llama.cpp"
 Write-Host "  启动位置 : $Root"
 
 # ---------------- 1. 找模型 ----------------
+# models\ 里可以放任意多个 .gguf，按下面的顺序决定用哪个：
+#   ① 启动参数 -ModelName 指定的文件名
+#   ② models\当前模型.txt 里写的文件名（在 高级选项.bat 的 [10] 里改）
+#   ③ 都没写 -> 用体积最大的那个
+# mmproj-*.gguf 是多模态投影文件，不是模型本体，不参与挑选也不参与比较。
 if (-not (Test-Path $DirModels)) { Write-Host "  [错误] 找不到 models 目录" -ForegroundColor Red; Read-Host "  回车退出"; exit 1 }
-$model = Get-ChildItem $DirModels -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
-         Sort-Object Length -Descending | Select-Object -First 1
-if (-not $model) { Write-Host "  [错误] models 目录里没有 .gguf 模型文件" -ForegroundColor Red; Read-Host "  回车退出"; exit 1 }
+
+$allModels = @(Get-ChildItem $DirModels -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -notlike "mmproj-*" })
+if ($allModels.Count -eq 0) { Write-Host "  [错误] models 目录里没有 .gguf 模型文件" -ForegroundColor Red; Read-Host "  回车退出"; exit 1 }
+
+$pickFile = Join-Path $DirModels "当前模型.txt"
+$model    = $null
+$source   = ""
+
+if ($ModelName) {
+    $model = $allModels | Where-Object { $_.Name -eq $ModelName } | Select-Object -First 1
+    if (-not $model) {
+        Write-Host "  [错误] models 目录里没有叫「$ModelName」的模型。现有的有：" -ForegroundColor Red
+        $allModels | Sort-Object Length -Descending | ForEach-Object { Write-Host "         $($_.Name)" }
+        Read-Host "  回车退出"; exit 1
+    }
+    $source = "启动参数 -ModelName 指定"
+} elseif (Test-Path $pickFile) {
+    $want = Get-Content $pickFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ($want) { $want = $want.Trim() }
+    if ($want) {
+        $model = $allModels | Where-Object { $_.Name -eq $want } | Select-Object -First 1
+        if ($model) { $source = "models\当前模型.txt 指定" }
+        else { Write-Host "  [注意] 当前模型.txt 里写的「$want」在 models\ 里找不到，改回自动选最大的。" -ForegroundColor Yellow }
+    }
+}
+
+if (-not $model) {
+    $model  = $allModels | Sort-Object Length -Descending | Select-Object -First 1
+    $source = "自动（体积最大）"
+}
 
 $modelGB = [math]::Round($model.Length / 1GB, 2)
+$alias   = [IO.Path]::GetFileNameWithoutExtension($model.Name)
 Write-Host "  模型     : $($model.Name)" -ForegroundColor Green
 Write-Host "  模型大小 : $modelGB GB"
+if ($allModels.Count -gt 1) {
+    Write-Host "  选择依据 : $source" -ForegroundColor DarkGray
+    Write-Host "  可选模型 :" -ForegroundColor DarkGray
+    foreach ($m in ($allModels | Sort-Object Length -Descending)) {
+        $mark = ""
+        if ($m.Name -eq $model.Name) { $mark = "   <- 本次使用" }
+        Write-Host ("             {0}  ({1:N2} GB){2}" -f $m.Name, ($m.Length / 1GB), $mark) -ForegroundColor DarkGray
+    }
+    Write-Host "  换模型   : 打开 高级选项.bat 选 [10]" -ForegroundColor DarkGray
+}
 
 # ---------------- 2. 探测硬件 ----------------
 $cores = 0
@@ -239,7 +287,7 @@ if ($ramTiny) {
 # ---------------- 6. 拼参数 ----------------
 $llamaArgs = @(
     "-m", $model.FullName,
-    "--alias", "mimo-v2.6-distill-qwen-9b",
+    "--alias", $alias,
     "--host", "127.0.0.1",
     "--port", "$Port",
     "--n-gpu-layers", "$Ngl",

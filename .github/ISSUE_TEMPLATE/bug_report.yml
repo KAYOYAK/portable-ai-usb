@@ -1,0 +1,91 @@
+name: 报错 / 用不了
+description: 启动失败、报错、界面打不开、速度异常
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先跑一下 `高级选项.bat` 的 **[9] 环境自检**，把结果贴上来 —— 相当一部分问题一眼就能定位。
+
+        另外，如果你的问题一句话就能说清（比如"能不能在 XX 上跑"），
+        直接开个普通 Issue 说就行，不用套这个表单。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 你做了什么、期望什么、实际看到什么。
+      placeholder: |
+        双击 启动AI.bat 后黑窗口一闪就没了，浏览器没有打开。
+    validations:
+      required: true
+
+  - type: textarea
+    id: window
+    attributes:
+      label: 黑窗口里的完整输出
+      description: |
+        在黑窗口里右键 → 标记 → 选中全部 → 回车复制。
+        **这一段比什么都有用**，特别是「已选后端」和「[注意]」那几行。
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: 黑窗口里「已选后端」那一行写的是什么
+      options:
+        - NVIDIA CUDA 13.4  (显卡加速)
+        - Vulkan  (AMD / Intel / 老NVIDIA 通用加速)
+        - 纯 CPU  (兼容模式，慢)
+        - 没走到这一步就失败了
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: logs\ 目录里的日志
+      description: |
+        U 盘 `logs\` 下最新的那个 `server-*.log`，以及同名的 `server-*.log.err`，各取末尾 50 行。
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: selftest
+    attributes:
+      label: 环境自检结果
+      description: 高级选项.bat → [9] 最后那个「通过 / 注意 / 缺失」的计数
+      placeholder: "通过 17   注意 0   缺失 0"
+    validations:
+      required: false
+
+  - type: input
+    id: machine
+    attributes:
+      label: 这台电脑
+      description: Windows 版本 / CPU / 内存 / 显卡（有独显的话写上显存）
+      placeholder: "Windows 11 24H2 / i5-1235U / 16 GB / 无独显"
+    validations:
+      required: true
+
+  - type: input
+    id: usb
+    attributes:
+      label: U 盘
+      description: 容量 / 文件系统 / 是不是 USB 3.0
+      placeholder: "SanDisk 128 GB / exFAT / USB 3.0"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: 已经试过
+      options:
+        - label: 用「高级选项.bat」逐个换过后端试过
+        - label: 看过 docs/常见问题.md
+        - label: 杀毒软件没有拦（或者已经加过白名单）

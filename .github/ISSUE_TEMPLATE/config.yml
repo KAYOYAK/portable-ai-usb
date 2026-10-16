@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先看常见问题（常见问题.md）
+    url: https://github.com/KAYOYAK/portable-ai-usb/blob/main/docs/常见问题.md
+    about: 启动失败、缺少 DLL、显存不足、端口占用、Mac 能不能用 —— 大部分问题这里已经有答案
+  - name: 杀毒软件拦截 / 报毒
+    url: https://github.com/KAYOYAK/portable-ai-usb/blob/main/docs/杀毒软件误报.md
+    about: 为什么会被拦、怎么自己核实、怎么加白名单
+  - name: 使用说明
+    url: https://github.com/KAYOYAK/portable-ai-usb/blob/main/使用说明.txt
+    about: 怎么用、对电脑的要求、目录结构、换模型

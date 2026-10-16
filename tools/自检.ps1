@@ -46,7 +46,9 @@ if (Test-Path $dirModels) {
 }
 if ($models.Count -gt 0) {
     foreach ($m in $models) { P ("模型 {0}  ({1:N2} GB)" -f $m.Name, ($m.Length / 1GB)) }
-    if ($models.Count -gt 1) { W "有 $($models.Count) 个模型，启动器只会用最大的那个" }
+    if ($models.Count -gt 1) {
+        I "有 $($models.Count) 个模型，默认用最大的那个（要换用「高级选项.bat」的 [10]）"
+    }
 } else { F "models\ 里没有 .gguf 模型" }
 
 # 引擎

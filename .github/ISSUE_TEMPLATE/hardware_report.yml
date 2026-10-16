@@ -1,0 +1,82 @@
+name: 硬件兼容性反馈（跑通了 / 跑不通）
+description: 在某种机器上的实测结果 —— 这类记录对别人比 Bug 报告更有用
+title: "[兼容性] "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个项目要面对的是"任何一台电脑"，所以**每一条真实机器的记录都有价值 ——
+        不管是跑通了还是跑不通**。
+
+        觉得下面要填的太多，就只填「结果」+「CPU / 内存 / 显卡」三项也行。
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: 结果
+      options:
+        - 完全正常，能对话
+        - 能起来，但很慢
+        - 启动失败
+        - 能起来，但中途崩了
+    validations:
+      required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: "AMD Ryzen 7 7840HS"
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: 内存
+      placeholder: "32 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: 显卡
+      placeholder: "NVIDIA RTX 4060 Laptop 8 GB   /   或写「无独显」"
+    validations:
+      required: true
+
+  - type: input
+    id: backend
+    attributes:
+      label: 启动器选了哪个后端
+      description: 黑窗口里「已选后端」那一行
+      placeholder: "NVIDIA CUDA 13.4"
+    validations:
+      required: false
+
+  - type: input
+    id: speed
+    attributes:
+      label: 生成速度
+      description: 大概每秒几个字就够了，不用精确
+      placeholder: "约 30 tok/s"
+    validations:
+      required: false
+
+  - type: input
+    id: driver
+    attributes:
+      label: 显卡驱动版本（有独显时）
+      placeholder: "617.42"
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: 备注
+      description: 比如"要关掉核显才能在 Vulkan 下跑"、"开机花了 3 分钟"、"拔盘前必须先在托盘安全弹出"这类。
+    validations:
+      required: false
