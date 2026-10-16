@@ -22,6 +22,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { $Host.UI.RawUI.WindowTitle = "U盘 AI 便携版 - MiMo 9B" } catch { }
 
 # ---------------- 路径（全部相对 U 盘） ----------------
 $Root = $PSScriptRoot
