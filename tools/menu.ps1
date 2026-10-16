@@ -31,6 +31,21 @@ function Pause-Safe {
     try { Pause } catch { }
 }
 
+# 读一个选择。stdin 被重定向时（管道、计划任务、自动化测试）：
+#   PowerShell 5.1 的 Read-Host 会抛 "PowerShell 处于非交互模式"，
+#   在 $ErrorActionPreference="Stop" 下直接把整个脚本带走 —— 表现是菜单
+#   渲染一次就没了。这里改成显式读一行，读不到才返回 $null。
+function Read-Choice([string]$Prompt) {
+    try {
+        if ([Console]::IsInputRedirected) {
+            $line = [Console]::In.ReadLine()
+            if ($null -eq $line) { return $null }
+            return $line.Trim()
+        }
+    } catch { return $null }
+    try { return (Read-Host $Prompt).Trim() } catch { return $null }
+}
+
 function Show-Menu {
     Clear-Safe
     Write-Host ""
@@ -50,16 +65,20 @@ function Show-Menu {
     Write-Host "    [8]  打开 AI 网页界面"
     Write-Host "    [9]  环境自检  (U盘文件是否齐全)"
     Write-Host "    [10] 选择使用哪个模型  (models\ 下有多个时)"
+    Write-Host "    [11] 测一下这支 U 盘的速度  (看看要等多久)"
+    Write-Host "    [12] 启动  -  不用 mmap  (慢盘卡顿时用, 占内存)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
     Write-Host "  ============================================================"
 }
 
-function Invoke-Launcher {
-    param([string[]]$ExtraArgs)
-    & $Launcher @ExtraArgs
-}
+# 注意：这里一律直接写 & $Launcher -Param value，不要包一层
+#   function Invoke-Launcher { param([string[]]$ExtraArgs) & $Launcher @ExtraArgs }
+# 再用 Invoke-Launcher @('-Bench') 调用。
+# 数组 splat 是**按位置**传参，不是按名字：@('-Bench') 会把字符串 "-Bench"
+# 当成第一个位置参数的值，绑到 $Backend 上，$Bench 永远是 $False ——
+# 表现就是选 [11] 却启动了一个服务器。写死参数名则静态可查、不可能错。
 
 # [10] 换模型：把选择写进 models\当前模型.txt，launcher.ps1 下次读它。
 # 写纯文本而不是改脚本，是为了让 U 盘在只读介质、或用户没装编辑器的情况下也能换模型。
@@ -104,9 +123,8 @@ function Select-Model {
     Write-Host ""
     Write-Host "  ============================================================"
 
-    $sel = Read-Host "   请选择"
+    $sel = Read-Choice "   请选择"
     if ($null -eq $sel) { return }
-    $sel = $sel.Trim()
 
     if ($sel -eq 'a' -or $sel -eq 'A') {
         Remove-Item $pickFile -Force -ErrorAction SilentlyContinue
@@ -143,24 +161,23 @@ if (-not (Test-Path $Launcher)) {
 
 while ($true) {
     Show-Menu
-    $opt = Read-Host "   请选择"
+    $opt = Read-Choice "   请选择"
     if ($null -eq $opt) { exit 0 }        # stdin 已关闭（非交互运行）时直接退出
-    $opt = $opt.Trim()
 
     switch ($opt) {
-        "1" { Invoke-Launcher @('-Backend','cuda','-Ctx','32768','-Ngl','99') }
-        "2" { Invoke-Launcher @('-Backend','cuda','-Ctx','65536','-Ngl','99') }
-        "3" { Invoke-Launcher @('-Backend','cuda','-Ctx','8192','-Ngl','99') }
-        "4" { Invoke-Launcher @('-Backend','vulkan','-Ngl','99') }
-        "5" { Invoke-Launcher @('-Backend','cpu','-Ngl','0','-Ctx','8192') }
+        "1" { & $Launcher -Backend cuda   -Ctx 32768 -Ngl 99 }
+        "2" { & $Launcher -Backend cuda   -Ctx 65536 -Ngl 99 }
+        "3" { & $Launcher -Backend cuda   -Ctx 8192  -Ngl 99 }
+        "4" { & $Launcher -Backend vulkan -Ngl 99 }
+        "5" { & $Launcher -Backend cpu    -Ngl 0 -Ctx 8192 }
         "6" {
-            Invoke-Launcher @('-Probe')
+            & $Launcher -Probe
             Write-Host ""
             Pause-Safe
         }
         "7" {
             Clear-Safe
-            Invoke-Launcher @('-Stop')
+            & $Launcher -Stop
             Write-Host ""
             Pause-Safe
         }
@@ -172,6 +189,16 @@ while ($true) {
             Pause-Safe
         }
         "10" { Select-Model }
+        "11" {
+            Clear-Safe
+            # 测速不启动引擎；结果用来告诉人"预计要等多久"
+            & $Launcher -Bench
+        }
+        "12" {
+            # 兜底：慢盘上 mmap 按需分页会卡，改成整块读进内存。
+            # launcher 自己会检查内存装不装得下，装不下会改回 auto 并说明原因。
+            & $Launcher -LoadMode none
+        }
         "0" { exit 0 }
         "q" { exit 0 }
         default { }

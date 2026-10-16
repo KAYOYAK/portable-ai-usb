@@ -21,7 +21,11 @@ param(
                                    # 不敏感，会和下面的 $model 变成同一个变量，[string]
                                    # 的类型约束把 FileInfo 强转成字符串，.Name/.FullName 全空。
     [switch]$Probe,                # 只探测环境，不启动
-    [switch]$Stop                  # 只停掉"本 U 盘"启动的引擎
+    [switch]$Stop,                 # 只停掉"本 U 盘"启动的引擎
+    [switch]$Bench,                # 只测这支 U 盘的读取速度，不启动
+    [ValidateSet("auto","mmap","none","mlock","mmap+mlock","dio")]
+    [string]$LoadMode = "auto"     # 模型加载方式。默认 auto（=mmap，按需分页）。
+                                   # 慢盘上 mmap 抖动导致卡顿时，用 none 整块读进内存。
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +48,15 @@ function Head($t) {
     Write-Host ("=" * 64) -ForegroundColor DarkCyan
     Write-Host ("  " + $t) -ForegroundColor Cyan
     Write-Host ("=" * 64) -ForegroundColor DarkCyan
+}
+
+# 等一个回车。stdin 被重定向时（自动化测试、计划任务）Read-Host 会抛
+# "PowerShell 处于非交互模式" 并让整个脚本以退出码 1 死掉 —— 这里兜住它。
+function Wait-Enter([string]$Msg = "  回车退出") {
+    try {
+        if ([Console]::IsInputRedirected) { return }
+    } catch { return }
+    try { Read-Host $Msg } catch { }
 }
 
 # 判断某个路径是不是在本 U 盘目录下（用来区分"我们的"进程）
@@ -88,11 +101,25 @@ Write-Host "  启动位置 : $Root"
 #   ② models\当前模型.txt 里写的文件名（在 高级选项.bat 的 [10] 里改）
 #   ③ 都没写 -> 用体积最大的那个
 # mmproj-*.gguf 是多模态投影文件，不是模型本体，不参与挑选也不参与比较。
-if (-not (Test-Path $DirModels)) { Write-Host "  [错误] 找不到 models 目录" -ForegroundColor Red; Read-Host "  回车退出"; exit 1 }
+if (-not (Test-Path $DirModels)) {
+    Write-Host "  [错误] 找不到 models 目录 —— 这支盘还没准备好" -ForegroundColor Red
+    Write-Host "         期望位置：$DirModels" -ForegroundColor DarkGray
+    Write-Host "         该怎么办：" -ForegroundColor Gray
+    Write-Host "           1. 确认这支盘插好了，盘符确实是 $($Root.Substring(0,2))" -ForegroundColor Gray
+    Write-Host "           2. 新建 models\ 目录，把 .gguf 模型文件放进去" -ForegroundColor Gray
+    Write-Host "           3. 还没下过模型的话，运行 tools\准备U盘.ps1 自动组装" -ForegroundColor Gray
+    Wait-Enter; exit 1
+}
 
 $allModels = @(Get-ChildItem $DirModels -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
                Where-Object { $_.Name -notlike "mmproj-*" })
-if ($allModels.Count -eq 0) { Write-Host "  [错误] models 目录里没有 .gguf 模型文件" -ForegroundColor Red; Read-Host "  回车退出"; exit 1 }
+if ($allModels.Count -eq 0) {
+    Write-Host "  [错误] models 目录里没有模型 —— 一个 .gguf 都没有" -ForegroundColor Red
+    Write-Host "         位置：$DirModels" -ForegroundColor DarkGray
+    Write-Host "         模型是单独下载的（约 6.4 GB），不在 Git 仓库里。" -ForegroundColor Gray
+    Write-Host "         运行 tools\准备U盘.ps1 可以自动下载并校验，或者手动下好放进 models\。" -ForegroundColor Gray
+    Wait-Enter; exit 1
+}
 
 $pickFile = Join-Path $DirModels "当前模型.txt"
 $model    = $null
@@ -135,7 +162,7 @@ if ($ModelName) {
         } else {
             Show-ModelList "models 目录里找不到叫「$ModelName」的模型"
         }
-        Read-Host "  回车退出"; exit 1
+        Wait-Enter; exit 1
     }
     $model  = $r.File
     $source = "启动参数 -ModelName 指定"
@@ -168,6 +195,307 @@ if ($allModels.Count -gt 1) {
         Write-Host ("             {0}  ({1:N2} GB){2}" -f $m.Name, ($m.Length / 1GB), $mark) -ForegroundColor DarkGray
     }
     Write-Host "  换模型   : 打开 高级选项.bat 选 [10]" -ForegroundColor DarkGray
+}
+
+# ---------------- 1.5 这支 U 盘有多快 ----------------
+# 为什么要测：模型是 mmap 按需从 U 盘读的。同一支盘插在 USB 2.0 口上，
+# 加载时间会从十几秒掉到几分钟。测出来才能给出"要等多久"的实话，
+# 也才能在盘太慢的时候直接告诉用户换口/换盘，而不是让人对着黑屏猜。
+# 无缓冲读的底座。FILE_FLAG_NO_BUFFERING 绕过 Windows 的系统缓存，
+# 直接向设备要数据 —— 这才是"这支盘有多快"的唯一真话。
+# 代价：读缓冲区的地址和文件偏移都必须按 4096 对齐，所以手工分配再对齐。
+$script:RawDiskCs = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class PsRawDisk
+{
+    const uint GENERIC_READ          = 0x80000000;
+    const uint FILE_SHARE_READ       = 0x00000001;
+    const uint FILE_SHARE_WRITE      = 0x00000002;
+    const uint OPEN_EXISTING         = 3;
+    const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess,
+        uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool ReadFile(SafeFileHandle hFile, IntPtr lpBuffer,
+        uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetFilePointerEx(SafeFileHandle hFile, long liDistanceToMove,
+        out long lpNewFilePointer, uint dwMoveMethod);
+
+    public static SafeFileHandle Open(string path)
+    {
+        return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, IntPtr.Zero);
+    }
+
+    public static long Seek(SafeFileHandle h, long pos)
+    {
+        long got;
+        return SetFilePointerEx(h, pos, out got, 0) ? got : -1;
+    }
+
+    public static int Read(SafeFileHandle h, IntPtr buf, int count)
+    {
+        uint got;
+        return ReadFile(h, buf, (uint)count, out got, IntPtr.Zero) ? (int)got : -1;
+    }
+
+    public static IntPtr AllocAligned(int size, out IntPtr raw)
+    {
+        raw = Marshal.AllocHGlobal(size + 4096);
+        return new IntPtr((raw.ToInt64() + 4095L) & ~4095L);
+    }
+
+    public static void Free(IntPtr raw) { if (raw != IntPtr.Zero) Marshal.FreeHGlobal(raw); }
+}
+'@
+
+function Measure-DiskReadRaw {
+    param([string]$Path)
+
+    $r = [ordered]@{ SeqMBps = 0.0; RandIOPS = 0; RandMBps = 0.0; Samples = @(); Error = $null; Raw = $true }
+    $h = $null; $rawSeq = [IntPtr]::Zero; $bufSeq = [IntPtr]::Zero
+    $rawBlk = [IntPtr]::Zero; $bufBlk = [IntPtr]::Zero
+    try {
+        if (-not ("PsRawDisk" -as [type])) {
+            Add-Type -TypeDefinition $script:RawDiskCs -Language CSharp -ErrorAction Stop
+        }
+        $h = [PsRawDisk]::Open($Path)
+        if ($null -eq $h -or $h.IsInvalid) {
+            throw ("CreateFile 失败，错误码 " + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        }
+        $len = (Get-Item -LiteralPath $Path).Length
+
+        # 顺序读：文件深处两个随机位置各读 32 MB，取较慢的一次。
+        # 无缓冲之后不再需要"往深处读躲缓存"—— 每次读都是真盘速 ——
+        # 但取两次里较慢的那个仍然有用：能躲开闪存偶尔的快突发。
+        $blockMB = 32
+        $want    = $blockMB * 1MB
+        $bufSeq  = [PsRawDisk]::AllocAligned($want, [ref]$rawSeq)
+        if ($len -gt ($want * 4)) {
+            $rnd   = New-Object System.Random
+            $spots = @((0.15 + $rnd.NextDouble() * 0.20),
+                       (0.50 + $rnd.NextDouble() * 0.30))
+            foreach ($pct in $spots) {
+                $pos = [long](($len * $pct) / 4096) * 4096      # 偏移也要 4096 对齐
+                if ([PsRawDisk]::Seek($h, $pos) -lt 0) { throw "SetFilePointerEx 失败（偏移 $pos）" }
+                $got = 0
+                $sw  = [System.Diagnostics.Stopwatch]::StartNew()
+                while ($got -lt $want) {
+                    $n = [PsRawDisk]::Read($h, $bufSeq, [math]::Min(1MB, $want - $got))
+                    if ($n -le 0) { break }
+                    $got += $n
+                }
+                $sw.Stop()
+                $sec = $sw.Elapsed.TotalSeconds
+                if ($sec -gt 0 -and $got -gt 0) {
+                    $r.Samples += [math]::Round(($got / 1MB) / $sec, 1)
+                }
+                if ($r.Samples.Count -eq 1 -and $r.Samples[0] -lt 40) { break }
+            }
+        }
+        if ($r.Samples.Count -gt 0) {
+            $r.SeqMBps = ($r.Samples | Measure-Object -Minimum).Minimum
+        }
+
+        # 随机 4 KB × 128 —— 闪存盘真正的瓶颈就在这里（常见只有 1~5 MB/s）。
+        # 无缓冲的 4K 读等于直接打设备队列，得到的 IOPS 才是插上后 mmap 会遇到的数。
+        if ($len -gt 64MB) {
+            $bufBlk = [PsRawDisk]::AllocAligned(4096, [ref]$rawBlk)
+            $rnd2   = New-Object System.Random
+            $base   = 64MB
+            $span   = $len - $base - 4096
+            $sw2    = [System.Diagnostics.Stopwatch]::StartNew()
+            $miss   = 0
+            for ($i = 0; $i -lt 128; $i++) {
+                $pos = $base + [long](($rnd2.NextDouble() * $span) / 4096) * 4096
+                if ([PsRawDisk]::Seek($h, $pos) -lt 0) { break }
+                if ([PsRawDisk]::Read($h, $bufBlk, 4096) -lt 0) { $miss++ }
+            }
+            $sw2.Stop()
+            $sec = $sw2.Elapsed.TotalSeconds
+            if ($sec -gt 0 -and $miss -eq 0) {
+                $r.RandIOPS = [math]::Round(128 / $sec, 0)
+                $r.RandMBps = [math]::Round((128 * 4KB / 1MB) / $sec, 2)
+            }
+        }
+    } catch {
+        $r.Error = $_.Exception.Message
+        $r.SeqMBps = 0.0
+    } finally {
+        if ($h) { $h.Dispose() }
+        [PsRawDisk]::Free($rawSeq)
+        [PsRawDisk]::Free($rawBlk)
+    }
+    return $r
+}
+
+# 为什么还留着一份带缓冲的实现：
+#   FILE_FLAG_NO_BUFFERING 在少数环境下会直接失败（盘被独占、部分虚拟盘 / 网络盘、
+#   非 4096 扇区）。那种时候退回带缓冲读，至少还能测个数 —— 只是可能吃到系统缓存，
+#   所以结果上打 Raw=$false，让 Show-DiskReport 去判断和提示。
+function Measure-DiskReadBuffered {
+    param([string]$Path)
+
+    $r = [ordered]@{ SeqMBps = 0.0; RandIOPS = 0; RandMBps = 0.0; Samples = @(); Error = $null; Raw = $false }
+    $fs = $null
+    try {
+        $fs  = [System.IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $len = $fs.Length
+
+        $buf     = New-Object byte[] (1MB)
+        $blockMB = 32
+        if ($len -gt ($blockMB * 1MB * 4)) {
+            $rndOff = New-Object System.Random
+            $spots  = @((0.15 + $rndOff.NextDouble() * 0.20),
+                        (0.50 + $rndOff.NextDouble() * 0.30))
+            foreach ($pct in $spots) {
+                $fs.Position = [long]($len * $pct)
+                $got  = 0
+                $want = $blockMB * 1MB
+                $sw   = [System.Diagnostics.Stopwatch]::StartNew()
+                while ($got -lt $want) {
+                    $n = $fs.Read($buf, 0, $buf.Length)
+                    if ($n -le 0) { break }
+                    $got += $n
+                }
+                $sw.Stop()
+                $sec = $sw.Elapsed.TotalSeconds
+                if ($sec -gt 0 -and $got -gt 0) {
+                    $r.Samples += [math]::Round(($got / 1MB) / $sec, 1)
+                }
+                if ($r.Samples.Count -eq 1 -and $r.Samples[0] -lt 40) { break }
+            }
+        }
+        if ($r.Samples.Count -gt 0) {
+            $r.SeqMBps = ($r.Samples | Measure-Object -Minimum).Minimum
+        }
+
+        # 种子必须每次不同：写死种子会让每回挑中同一批偏移，第二次跑全命中系统缓存。
+        if ($len -gt 64MB) {
+            $blk  = New-Object byte[] (4KB)
+            $rnd  = New-Object System.Random
+            $base = 64MB
+            $span = $len - $base - $blk.Length
+            $sw2  = [System.Diagnostics.Stopwatch]::StartNew()
+            for ($i = 0; $i -lt 128; $i++) {
+                $fs.Position = $base + [long]($rnd.NextDouble() * $span)
+                [void]$fs.Read($blk, 0, $blk.Length)
+            }
+            $sw2.Stop()
+            $sec = $sw2.Elapsed.TotalSeconds
+            if ($sec -gt 0) {
+                $r.RandIOPS = [math]::Round(128 / $sec, 0)
+                $r.RandMBps = [math]::Round((128 * 4KB / 1MB) / $sec, 2)
+            }
+        }
+    } catch {
+        $r.Error = $_.Exception.Message
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+    return $r
+}
+
+# 对外只暴露这一个。优先无缓冲；无缓冲不可用或读不出数，才退回带缓冲。
+function Measure-DiskRead {
+    param([string]$Path)
+
+    $raw = Measure-DiskReadRaw -Path $Path
+    if ($raw.SeqMBps -gt 0) { return $raw }
+
+    $buf = Measure-DiskReadBuffered -Path $Path
+    # 退回路径也失败时，把无缓冲那边的错误留下来 —— 那才是真正的原因
+    if ($buf.SeqMBps -le 0 -and -not $buf.Error) { $buf.Error = $raw.Error }
+    return $buf
+}
+
+function Get-EstimateSeconds {
+    param($Disk, [long]$ModelBytes)
+    if ($Disk.SeqMBps -le 0) { return 0 }
+    # 读完还要初始化后端：实测 CUDA 后端初始化约 5 秒，算进去更接近真实等待
+    return [int][math]::Ceiling(($ModelBytes / 1MB) / $Disk.SeqMBps) + 5
+}
+
+function Show-DiskReport {
+    param($Disk, [int]$EstSec, [double]$ModelGB)
+
+    # 无缓冲读的结果不可能是缓存 —— 那是直接问设备要的数。
+    # 只有退回带缓冲读（Raw=$false）时，>1500 MB/s 才只可能是系统缓存。
+    $cached = ((-not $Disk.Raw) -and ($Disk.SeqMBps -ge 1500))
+
+    $verdict, $color = switch ($true) {
+        ($cached)               { "内存缓存命中，不是真实盘速", "Yellow"; break }
+        ($Disk.SeqMBps -ge 250) { "很快（移动固态级别）", "Green";      break }
+        ($Disk.SeqMBps -ge 120) { "正常（USB 3.x 闪存盘）", "Green";    break }
+        ($Disk.SeqMBps -ge 60)  { "偏慢", "Yellow";                     break }
+        ($Disk.SeqMBps -gt 0)   { "很慢", "Red";                        break }
+        default                 { "测不出来", "DarkGray" }
+    }
+
+    Write-Host ""
+    Write-Host "  这支 U 盘：" -ForegroundColor DarkCyan
+    if ($Disk.Error) {
+        Write-Host "    测速失败（不影响使用）：$($Disk.Error)" -ForegroundColor DarkGray
+        return
+    }
+    Write-Host ("    顺序读    {0,7:N1} MB/s    {1}" -f $Disk.SeqMBps, $verdict) -ForegroundColor $color
+    if ($Disk.RandIOPS -gt 0) {
+        Write-Host ("    随机 4K   {0,7:N0} IOPS   ({1:N2} MB/s)" -f $Disk.RandIOPS, $Disk.RandMBps) -ForegroundColor DarkGray
+    }
+    if ($Disk.Raw) {
+        Write-Host "    （绕过系统缓存的实测值，就是这支盘的本事）" -ForegroundColor DarkGray
+    }
+    if ($cached) {
+        Write-Host ""
+        Write-Host "    这份模型已经被系统缓存过，上面的数字来自内存，不是这支盘的本事。" -ForegroundColor Yellow
+        # 缓存命中时给不出真实速度，但上次测到的真实值还在 —— 比什么都说不出强
+        $recall = Join-Path $DirLog "上次测速.txt"
+        if (Test-Path $recall) {
+            $line = Get-Content $recall -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($line) { Write-Host "    这支盘上次的真实测速：$line" -ForegroundColor Cyan }
+        } else {
+            Write-Host "    重启电脑后再测一次，就能得到真实数字。" -ForegroundColor Yellow
+        }
+        Write-Host "    分档参考：插到一台没跑过它的电脑上大概要等多久，见 docs/硬件与性能.md" -ForegroundColor DarkGray
+        return
+    }
+    if ($EstSec -gt 0) {
+        Write-Host ("    预计加载 {0} GB 模型约需 {1} 秒" -f $ModelGB, $EstSec) -ForegroundColor Cyan
+    }
+    # 真实测速：存一份，下次这份模型被缓存时至少能回看
+    try {
+        [System.IO.File]::WriteAllText(
+            (Join-Path $DirLog "上次测速.txt"),
+            ("{0:N1} MB/s · 随机4K {1:N0} IOPS · 预计 {2} 秒 · {3}" -f `
+                $Disk.SeqMBps, $Disk.RandIOPS, $EstSec, (Get-Date -Format "yyyy-MM-dd HH:mm")),
+            (New-Object System.Text.UTF8Encoding $false))
+    } catch { }
+    if ($Disk.SeqMBps -lt 60) {
+        Write-Host ""
+        Write-Host "    慢的常见原因：插在了 USB 2.0 口上，或者这是一支低速闪存盘。" -ForegroundColor Yellow
+        Write-Host "    先换个蓝色的 USB 3.0 口重插试试。还慢的话见 docs/硬件与性能.md" -ForegroundColor Yellow
+    }
+}
+
+if ($Bench) {
+    Head "测一下这支 U 盘的速度"
+    Write-Host "  测试文件 : $($model.Name)  ($modelGB GB)"
+    Write-Host "  读 2×32 MB 顺序 + 128 次随机 4K，几秒钟"
+    Write-Host "  （绕过系统缓存读，测的是这支盘本身）" -ForegroundColor DarkGray
+    $d = Measure-DiskRead -Path $model.FullName
+    Show-DiskReport -Disk $d -EstSec (Get-EstimateSeconds -Disk $d -ModelBytes $model.Length) -ModelGB $modelGB
+    Write-Host ""
+    Wait-Enter "  回车继续"
+    exit 0
 }
 
 # ---------------- 2. 探测硬件 ----------------
@@ -258,7 +586,7 @@ if (-not (Test-Path $exe)) {
 }
 if (-not (Test-Path $exe)) {
     Write-Host "  [错误] U盘 llama.cpp 目录里没有 llama-server.exe" -ForegroundColor Red
-    Read-Host "  回车退出"; exit 1
+    Wait-Enter; exit 1
 }
 
 $backendName = @{
@@ -318,6 +646,15 @@ if ($ramTiny) {
 # 不用 mlock：内存紧张的机器上 mlock 会把可用内存锁死。
 # 保持 mmap 默认值，让系统按需分页。
 
+# ---- -LoadMode 兜底开关：none / mlock 都要整份模型进内存，装不下就别用 ----
+$loadNote = $null
+if ($LoadMode -in @("none", "mlock", "mmap+mlock")) {
+    if ($ramGB -gt 0 -and $ramGB -lt ($modelGB + 1.5)) {
+        $loadNote = "内存只有 $ramGB GB，装不下 $modelGB GB 的模型加运行开销 —— 加载方式已改回 auto（mmap 按需分页）。"
+        $LoadMode = "auto"
+    }
+}
+
 # ---------------- 6. 拼参数 ----------------
 $llamaArgs = @(
     "-m", $model.FullName,
@@ -337,11 +674,17 @@ $llamaArgs = @(
 if ($backend -ne "cpu") {
     $llamaArgs += @("--flash-attn", "on", "--cache-type-k", $kvType, "--cache-type-v", $kvType)
 }
+if ($LoadMode -ne "auto") {
+    $llamaArgs += @("-lm", $LoadMode)
+}
 
 Write-Host ""
 Write-Host "  上下文   :  $Ctx tokens" -ForegroundColor DarkGray
 Write-Host "  显存卸载 :  $Ngl 层  (KV 缓存 $kvType)" -ForegroundColor DarkGray
 Write-Host "  CPU 线程 :  $threads" -ForegroundColor DarkGray
+if ($LoadMode -ne "auto") {
+    Write-Host "  加载方式 :  $LoadMode" -ForegroundColor DarkGray
+}
 if ($vramNote) {
     Write-Host ""
     Write-Host "  [注意] $vramNote" -ForegroundColor Yellow
@@ -349,6 +692,10 @@ if ($vramNote) {
 if ($ramNote) {
     Write-Host ""
     Write-Host "  [注意] $ramNote" -ForegroundColor Yellow
+}
+if ($loadNote) {
+    Write-Host ""
+    Write-Host "  [注意] $loadNote" -ForegroundColor Yellow
 }
 
 if ($Probe) {
@@ -358,6 +705,11 @@ if ($Probe) {
     Write-Host "  内存 = $ramGB GB      显存 = $nvVramGB GB"
     exit 0
 }
+
+# ---------------- 6.5 实测这支盘有多快，把"要等多久"说清楚 ----------------
+$disk   = Measure-DiskRead -Path $model.FullName
+$estSec = Get-EstimateSeconds -Disk $disk -ModelBytes $model.Length
+Show-DiskReport -Disk $disk -EstSec $estSec -ModelGB $modelGB
 
 # ---------------- 7. 端口占用：分清"我们的"和"别人的" ----------------
 function Test-PortBusy([int]$p) {
@@ -384,7 +736,7 @@ if (Test-PortBusy $Port) {
         Write-Host "  [提示] 端口 $Port 上已经有本 U 盘的 AI 在运行。" -ForegroundColor Yellow
         Write-Host "         直接打开 http://127.0.0.1:$Port 就能用。" -ForegroundColor Yellow
         if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$Port" }
-        Read-Host "  回车退出"
+        Wait-Enter
         exit 0
     }
 
@@ -395,7 +747,7 @@ if (Test-PortBusy $Port) {
     }
     if ($newPort -eq 0) {
         Write-Host "         $Port ~ $($Port + 20) 全被占用，无法启动。请先释放端口。" -ForegroundColor Red
-        Read-Host "  回车退出"; exit 1
+        Wait-Enter; exit 1
     }
     $Port = $newPort
     for ($i = 0; $i -lt $llamaArgs.Count - 1; $i++) {
@@ -409,7 +761,7 @@ $log = Join-Path $DirLog ("server-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".l
 $url = "http://127.0.0.1:$Port"
 
 Head "正在启动 AI 引擎"
-Write-Host "  加载 $modelGB GB 模型，约 10~60 秒，请勿关闭本窗口" -ForegroundColor Yellow
+Write-Host "  加载 $modelGB GB 模型，$(if ($estSec -gt 0) { "实测本盘预计约 $estSec 秒" } else { "约 10~60 秒" })，请勿关闭本窗口" -ForegroundColor Yellow
 Write-Host "  日志: $log" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -445,7 +797,7 @@ if ($proc.HasExited -and -not $ready) {
     Write-Host "   3) 内存太小      -> 选 [5] 纯CPU（mmap 按需分页，比硬塞进显存稳）"
     Write-Host "   4) 杀毒软件拦截  -> 允许 llama-server.exe 运行"
     Write-Host "   5) exe 起不来    -> 见 docs/常见问题.md 的『缺少 DLL』一节"
-    Read-Host "  回车退出"
+    Wait-Enter
     exit 1
 }
 
