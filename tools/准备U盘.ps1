@@ -8,7 +8,7 @@
   用法：
      powershell -ExecutionPolicy Bypass -File tools\准备U盘.ps1
      powershell -ExecutionPolicy Bypass -File tools\准备U盘.ps1 -Target E:
-     powershell -ExecutionPolicy Bypass -File tools\准备U盘.ps1 -Source D:\llama.cpp
+     powershell -ExecutionPolicy Bypass -File tools\准备U盘.ps1 -Source "你本机放 llama.cpp 的目录"
 
   说明：
      · 如果本机已经有一套 llama.cpp 和 GGUF 模型，用 -Source 直接拷，不走网络
@@ -212,7 +212,15 @@ if ($ModelPath -and (Test-Path $ModelPath)) { $localModel = (Resolve-Path $Model
 
 # 自动找：本机常见位置
 if (-not $localModel) {
-    foreach ($p in @("D:\models", "$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop")) {
+    # 先扫每块固定磁盘根目录下的 models\ ，再看用户目录
+    $searchRoots = @()
+    foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Root -match '^[A-Za-z]:\\$' })) {
+        $searchRoots += (Join-Path $d.Root 'models')
+    }
+    $searchRoots += @("$env:USERPROFILE\Downloads", "$env:USERPROFILE\Desktop")
+
+    foreach ($p in $searchRoots) {
         if (Test-Path $p) {
             $g = Get-ChildItem $p -Recurse -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
                  Sort-Object Length -Descending | Select-Object -First 1
