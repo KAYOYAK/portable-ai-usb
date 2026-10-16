@@ -88,10 +88,19 @@ U 盘里的模型是可以换的。启动器每次启动都会重新扫 models\
 
 有多个模型时：
   双击「高级选项.bat」，选 [10] 选择模型 ——
-  它会列出 models\ 里所有 .gguf，按序号选一个。
+  它会列出 models\ 里所有 .gguf，按序号选一个，
+  选完写进 models\当前模型.txt，下次启动就生效。
 
-  命令行也可以直接指定（文件名不用写全）：
+  命令行也可以直接指定，文件名写一部分就够了：
     launcher.ps1 -ModelName "Qwen3-4B"
+    launcher.ps1 -ModelName "MiMo"
+
+  匹配规则（按顺序试，命中即止）：
+    1. 完整文件名，如 Qwen3-4B-Test.gguf
+    2. 不写 .gguf 的名字，如 Qwen3-4B-Test
+    3. 不区分大小写的片段，如 qwen3-4b、MiMo
+  第 3 条只在"只匹配到一个"时才用；匹配到多个会列出来让你重填，
+  不会替你猜。
 
 挑模型要注意：
   * 格式必须是 .gguf（HuggingFace 上找仓库名带 GGUF 的）

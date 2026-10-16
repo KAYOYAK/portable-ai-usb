@@ -98,20 +98,54 @@ $pickFile = Join-Path $DirModels "当前模型.txt"
 $model    = $null
 $source   = ""
 
+# 把一个"大概的名字"解析成 models\ 里的具体文件：
+#   ① 完整文件名精确匹配
+#   ② 补上 .gguf 后精确匹配
+#   ③ 不区分大小写的子串匹配 —— 只有唯一命中才算数
+# 返回 @{ File = <FileInfo 或 $null>; Candidates = @() }
+function Resolve-ModelFile {
+    param([string]$Name, [object[]]$Pool)
+    if (-not $Name) { return @{ File = $null; Candidates = @() } }
+
+    $hit = @($Pool | Where-Object { $_.Name -eq $Name })
+    if ($hit.Count -eq 0) { $hit = @($Pool | Where-Object { $_.Name -eq "$Name.gguf" }) }
+    if ($hit.Count -eq 0) {
+        $hit = @($Pool |
+                 Where-Object { $_.Name.IndexOf($Name, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+                 Sort-Object Length -Descending)
+    }
+    if ($hit.Count -eq 1) { return @{ File = $hit[0]; Candidates = @() } }
+    return @{ File = $null; Candidates = $hit }
+}
+
+function Show-ModelList($headline) {
+    Write-Host "  [错误] $headline" -ForegroundColor Red
+    Write-Host "         models 目录里现有：" -ForegroundColor DarkGray
+    foreach ($m in ($allModels | Sort-Object Length -Descending)) {
+        Write-Host ("           {0}  ({1:N2} GB)" -f $m.Name, ($m.Length / 1GB)) -ForegroundColor DarkGray
+    }
+    Write-Host "         文件名可以只写一部分，例如 MiMo 或 Qwen3-4B" -ForegroundColor DarkGray
+}
+
 if ($ModelName) {
-    $model = $allModels | Where-Object { $_.Name -eq $ModelName } | Select-Object -First 1
-    if (-not $model) {
-        Write-Host "  [错误] models 目录里没有叫「$ModelName」的模型。现有的有：" -ForegroundColor Red
-        $allModels | Sort-Object Length -Descending | ForEach-Object { Write-Host "         $($_.Name)" }
+    $r = Resolve-ModelFile -Name $ModelName -Pool $allModels
+    if (-not $r.File) {
+        if ($r.Candidates.Count -gt 1) {
+            Show-ModelList "「$ModelName」匹配到多个模型（$($r.Candidates.Count) 个），说不准用哪个"
+        } else {
+            Show-ModelList "models 目录里找不到叫「$ModelName」的模型"
+        }
         Read-Host "  回车退出"; exit 1
     }
+    $model  = $r.File
     $source = "启动参数 -ModelName 指定"
 } elseif (Test-Path $pickFile) {
     $want = Get-Content $pickFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
     if ($want) { $want = $want.Trim() }
     if ($want) {
-        $model = $allModels | Where-Object { $_.Name -eq $want } | Select-Object -First 1
-        if ($model) { $source = "models\当前模型.txt 指定" }
+        $r = Resolve-ModelFile -Name $want -Pool $allModels
+        if ($r.File) { $model = $r.File; $source = "models\当前模型.txt 指定" }
+        elseif ($r.Candidates.Count -gt 1) { Write-Host "  [注意] 当前模型.txt 里的「$want」匹配到多个模型，说不准用哪个，改回自动选最大的。" -ForegroundColor Yellow }
         else { Write-Host "  [注意] 当前模型.txt 里写的「$want」在 models\ 里找不到，改回自动选最大的。" -ForegroundColor Yellow }
     }
 }

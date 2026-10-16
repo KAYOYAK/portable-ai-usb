@@ -30,6 +30,11 @@
   新增的模型参数原本叫 `$Model`，而脚本里已有 `$model` —— PowerShell 认为两者是同一个变量，
   `[string]` 的类型约束会把赋给它的 `FileInfo` 对象强制转成字符串，
   于是 `$model.Name` / `$model.FullName` 全部为空。参数已改名 `-ModelName`。
+- **`-ModelName` 只认完整文件名。** 原实现是 `$_.Name -eq $ModelName`，
+  写 `MiMo` 或 `MiMo-V2.6-Distill-Qwen-9B-Q5_K_M`（不带 `.gguf`）全部匹配不上，
+  而文档里写的是"文件名不用写全"。现在改为三级匹配：完整文件名 → 补 `.gguf` → 不区分大小写的子串；
+  子串匹配只有唯一命中才算数，命中多个会列出全部候选并退出，不会替你猜。
+- `tools\自检.ps1` 里"启动器只会用最大的那个"的提示已过时，改为指向 `[10]`。
 
 ### 变更
 
