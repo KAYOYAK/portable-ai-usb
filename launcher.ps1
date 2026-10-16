@@ -742,10 +742,17 @@ function Get-ModelTemplate([string]$ModelFileName) {
     if (-not (Test-Path $dir)) { return $null }
     $base = [System.IO.Path]::GetFileNameWithoutExtension($ModelFileName)
     try {
-        foreach ($f in (Get-ChildItem $dir -Filter "*.jinja" -File -ErrorAction SilentlyContinue)) {
-            $tbase = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-            if ($base.StartsWith($tbase, [System.StringComparison]::OrdinalIgnoreCase)) { return $f.FullName }
-        }
+        # 取"最长的那份"，和全仓模型名匹配一条规矩：有了 MiMo.jinja 又有 MiMo-V2.6-...jinja 时，
+        # 按 Get-ChildItem 的字母序返回会听天由命。注意这里不能用 Sort-Object Length —— FileInfo 的
+        # Length 是文件字节数，不是文件名长度，会按模板大小排。
+        $hit = Get-ChildItem $dir -Filter "*.jinja" -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $base.StartsWith([System.IO.Path]::GetFileNameWithoutExtension($_.Name),
+                                 [System.StringComparison]::OrdinalIgnoreCase)
+            } |
+            Sort-Object @{ Expression = { [System.IO.Path]::GetFileNameWithoutExtension($_.Name).Length } } -Descending |
+            Select-Object -First 1
+        if ($hit) { return $hit.FullName }
     } catch { }
     return $null
 }
