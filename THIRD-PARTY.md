@@ -13,7 +13,7 @@
 - 版权：The ggml authors
 - 本 U 盘用的是**官方预编译 Windows 二进制包**（release tag 形如 `b11270`），未做任何修改。
 
-> llama.cpp 的发布页里，`releases/latest` 那个 tag（形如 `v0.5.0`）**只有源码包，没有二进制**。
+> llama.cpp 的发布页里，`releases/latest` 那个 tag（2026-10-16 当天查为 `v0.7.0`）**只有源码包，没有二进制**。
 > 真正的预编译包挂在 `b####` 形式的 tag 上。
 > 取用方式：<https://github.com/ggml-org/llama.cpp/releases/expanded_assets/b11270>
 

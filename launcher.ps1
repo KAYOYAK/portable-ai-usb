@@ -102,7 +102,6 @@ try { $gpuNames = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Fo
 # 坑：PowerShell 的 -match / -notmatch 对数组返回的是"匹配到的元素"而不是布尔值。
 #     双显卡机器上（核显+独显）直接当条件用必翻车。先压成明确的布尔量。
 $hasNvidia    = [bool]@($gpuNames | Where-Object { $_ -match '(?i)nvidia' }).Count
-$hasStrongGpu = [bool]@($gpuNames | Where-Object { $_ -match '(?i)RTX|Radeon RX|Arc [AB]' }).Count
 
 $nvVramGB = 0
 try {
@@ -191,6 +190,7 @@ if ($Ngl -lt 0) {
     if ($backend -eq "cpu") { $Ngl = 0 } else { $Ngl = 99 }
 }
 
+$vramUnknown = $false
 if ($Ctx -le 0) {
     # MiMo 9B: 8 层全注意力 / 4 个 KV 头 / head_dim 256
     #   KV 缓存约 32KB/token(f16)、16KB(q8_0)、8KB(q4_0)
@@ -202,14 +202,24 @@ if ($Ctx -le 0) {
     } elseif ($nvVramGB -ge 6)  { $Ctx = 8192
     } elseif ($nvVramGB -gt 0)  { $Ctx = 4096; $Ngl = 20
     } else {
-        if ($hasStrongGpu) { $Ctx = 32768 } else { $Ctx = 16384 }
+        # 拿不到显存数字：nvidia-smi 不在 PATH，或这台机器走的是 Vulkan / AMD 卡。
+        # 坑：这里别按显卡型号名字猜大小 —— 猜大了就是显存不足直接崩。
+        #     给保守档，用户在 高级选项.bat 里确认能跑之后可以手动往上调。
+        $Ctx = 8192
+        $vramUnknown = $true
     }
 }
 
 # KV 量化：显存紧张就压一压（只压缓存精度，不动模型权重）
 $kvType = "q8_0"
 if ($backend -eq "cpu") { $kvType = "f16" }
+elseif ($vramUnknown) { $kvType = "q4_0" }
 elseif ($nvVramGB -gt 0 -and $nvVramGB -lt 9) { $kvType = "q4_0" }
+
+$vramNote = $null
+if ($vramUnknown -and $backend -ne "cpu") {
+    $vramNote = "读不到本机显存大小，已按保守值起步（上下文 $Ctx、KV $kvType）。如果这台机器显存其实充足，用 高级选项.bat 的 [1] / [2] 手动提上去。"
+}
 
 # ---- 内存自动降级：内存不够时主动压低上下文，而不是等系统换页换死 ----
 $ramNote = $null
@@ -249,6 +259,10 @@ Write-Host ""
 Write-Host "  上下文   :  $Ctx tokens" -ForegroundColor DarkGray
 Write-Host "  显存卸载 :  $Ngl 层  (KV 缓存 $kvType)" -ForegroundColor DarkGray
 Write-Host "  CPU 线程 :  $threads" -ForegroundColor DarkGray
+if ($vramNote) {
+    Write-Host ""
+    Write-Host "  [注意] $vramNote" -ForegroundColor Yellow
+}
 if ($ramNote) {
     Write-Host ""
     Write-Host "  [注意] $ramNote" -ForegroundColor Yellow
