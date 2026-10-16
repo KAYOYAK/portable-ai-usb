@@ -24,8 +24,17 @@ param(
     [switch]$Stop,                 # 只停掉"本 U 盘"启动的引擎
     [switch]$Bench,                # 只测这支 U 盘的读取速度，不启动
     [ValidateSet("auto","mmap","none","mlock","mmap+mlock","dio")]
-    [string]$LoadMode = "auto"     # 模型加载方式。默认 auto（=mmap，按需分页）。
+    [string]$LoadMode = "auto",    # 模型加载方式。默认 auto（=mmap，按需分页）。
                                    # 慢盘上 mmap 抖动导致卡顿时，用 none 整块读进内存。
+    [switch]$Lan,                  # 让同一个 wifi / 局域网里的手机、平板也能连上用。
+                                   # 不加这个开关时只监听 127.0.0.1，同网段的人碰不到。
+    [string]$ApiKey = "",          # -Lan 时给接口加一把钥匙。留空 = 不设，
+                                   # 同一个网络里任何人都能用（家里 wifi 通常没问题）。
+    [int]$MaxRetry = 2,            # 显存/内存不足时自动降档重试的次数上限。
+                                   # 0 = 不重试，直接报错退出。
+    [switch]$NoSystemPrompt,       # 关掉默认的中文系统提示（模型会按自己的脾气挑语言）
+    [string]$SystemPrompt = ""     # 自定义默认系统提示。留空 = 用内置那句"始终用简体中文"。
+                                   # 只在客户端自己没发 system 消息时补上；客户端带了就听客户端的。
 )
 
 $ErrorActionPreference = "Stop"
@@ -696,32 +705,121 @@ if ($LoadMode -in @("none", "mlock", "mmap+mlock")) {
     }
 }
 
+# ---------------- 5.9 -Lan：找出这台电脑在局域网里的地址 ----------------
+# 只认真正连了路由器（有默认网关）、又不是回环或 169.254 自动私有地址的网卡。
+# 找不到就别假装能连 —— 宁可说清楚"只能本机用"，也不要打印一个连不上的地址。
+function Get-LanIP {
+    try {
+        foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($ni.OperationalStatus -ne "Up") { continue }
+            if ($ni.NetworkInterfaceType -eq "Loopback") { continue }
+            $props = $ni.GetIPProperties()
+            if (-not $props.GatewayAddresses -or $props.GatewayAddresses.Count -eq 0) { continue }
+            foreach ($ua in $props.UnicastAddresses) {
+                if ($ua.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+                $s = $ua.Address.ToString()
+                if ($s.StartsWith("169.254.")) { continue }
+                return $s
+            }
+        }
+    } catch { }
+    return $null
+}
+
+$lanArg = "127.0.0.1"
+$lanIP  = $null
+if ($Lan) {
+    $lanIP = Get-LanIP
+    if ($lanIP) { $lanArg = "127.0.0.1,$lanIP" }
+}
+
+# ---------------- 5.95 默认系统提示：借模型自己那份模板，只在开头补一条 system ----------------
+# 引擎没有"默认 system"这种参数，模型的模板里也没有对应变量 —— 唯一可行的办法是
+# 拿模型自己那份模板改三行（见 templates\*.jinja）。所以匹配不上就绝不硬套：
+# 换了模型还拿旧格式的模板去喂，输出会整段烂掉。
+function Get-ModelTemplate([string]$ModelFileName) {
+    $dir = Join-Path $Root "templates"
+    if (-not (Test-Path $dir)) { return $null }
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($ModelFileName)
+    try {
+        foreach ($f in (Get-ChildItem $dir -Filter "*.jinja" -File -ErrorAction SilentlyContinue)) {
+            $tbase = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            if ($base.StartsWith($tbase, [System.StringComparison]::OrdinalIgnoreCase)) { return $f.FullName }
+        }
+    } catch { }
+    return $null
+}
+
+# 这句是测出来的，不是想出来的。同一个模型、同一个问题，六种说法各跑 2~4 次：
+#   「你必须始终使用简体中文回答，无论用户用什么语言提问。」        → 全英文
+#   「始终用简体中文回答。」                                  → 全英文
+#   「无论用户用什么语言提问，你都只能用简体中文回答，不要使用英文。」 → 全英文
+#   「你是中文助手，回答一律使用简体中文，禁止英文。」            → 全英文
+#   「优先用简体中文回答；用户明确指定别的语言时听用户的。」        → 全英文
+#   「中文回答。回答必须全部是简体中文，不要出现英文单词。」        → 4/4 中文 ✓
+# 最后这句还**不会跟用户抢**：用户明说 "answer in English" 时它照样用英文（0/2 中文）。
+# 9B 模型对客气的长句基本不理会，只对短、直、动词开头的祈使句有反应。
+$DefaultChinesePrompt = "中文回答。回答必须全部是简体中文，不要出现英文单词。"
+if ($NoSystemPrompt)   { $sysPrompt = "" }
+elseif ($SystemPrompt) { $sysPrompt = $SystemPrompt }
+else                   { $sysPrompt = $DefaultChinesePrompt }
+
+$tplFile  = $null
+$tplNote  = $null
+if ($sysPrompt) {
+    $tplFile = Get-ModelTemplate $model.Name
+    if (-not $tplFile) {
+        $tplNote = "想让模型默认说中文，但 templates\ 里没有匹配 $($model.Name) 的模板 —— 本次不注入，模型自己挑语言。"
+        $sysPrompt = ""
+    }
+}
+
 # ---------------- 6. 拼参数 ----------------
-$llamaArgs = @(
-    "-m", $model.FullName,
-    "--alias", $alias,
-    "--host", "127.0.0.1",
-    "--port", "$Port",
-    "--n-gpu-layers", "$Ngl",
-    "--ctx-size", "$Ctx",
-    "--threads", "$threads",
-    "--jinja",
-    "--reasoning-format", "deepseek",
-    "--temp", "0.6",
-    "--top-p", "0.95",
-    "--top-k", "20",
-    "--min-p", "0"
-)
-if ($backend -ne "cpu") {
-    $llamaArgs += @("--flash-attn", "on", "--cache-type-k", $kvType, "--cache-type-v", $kvType)
+# 参数要拼两次：第一次按原配置，降档重试时按新配置。只留这一份拼装逻辑 ——
+# 之前降档那段是手抄一遍的，后来加的开关（多模态、默认系统提示、局域网钥匙）
+# 少抄一个就会在重试时悄悄失效，这种漏抄没人看得出来。
+function Build-Args {
+    $a = @(
+        "-m", $model.FullName,
+        "--alias", $alias,
+        "--host", $lanArg,
+        "--port", "$Port",
+        "--n-gpu-layers", "$Ngl",
+        "--ctx-size", "$Ctx",
+        "--threads", "$threads",
+        "--jinja",
+        "--reasoning-format", "deepseek",
+        "--temp", "0.6",
+        "--top-p", "0.95",
+        "--top-k", "20",
+        "--min-p", "0"
+    )
+    # 纯 CPU 跑时没有 CUDA/Vulkan 后端，--flash-attn 和 KV 量化都是显卡侧的东西。
+    if ($backend -ne "cpu") {
+        $a += @("--flash-attn", "on", "--cache-type-k", $kvType, "--cache-type-v", $kvType)
+    }
+    if ($LoadMode -ne "auto") {
+        $a += @("-lm", $LoadMode)
+    }
+    if ($mmproj) {
+        $a += @("-mm", $mmproj.FullName)
+    } else {
+        $a += @("--no-mmproj")
+    }
+    # 默认系统提示：模型自己的模板 + 一个模板变量。JSON 里的引号会在 Windows 拼
+    # 命令行时被吃掉（引擎报 "invalid literal; last read: '{d'"），必须转成 \" 再传。
+    if ($sysPrompt -and $tplFile) {
+        $kw = (@{ default_system = $sysPrompt } | ConvertTo-Json -Compress) -replace '"', '\"'
+        $a += @("--chat-template-file", $tplFile, "--chat-template-kwargs", $kw)
+    }
+    return $a
 }
-if ($LoadMode -ne "auto") {
-    $llamaArgs += @("-lm", $LoadMode)
-}
-if ($mmproj) {
-    $llamaArgs += @("-mm", $mmproj.FullName)
-} else {
-    $llamaArgs += @("--no-mmproj")
+
+$llamaArgs = Build-Args
+# 引擎默认没设钥匙时会自己打一行警告："no API key is set and CORS allows all origins"。
+# 只在本机跑时无所谓；一旦 -Lan 开了局域网，同一个 wifi 下谁都能用 —— 加不加钥匙由人决定。
+if ($Lan -and $ApiKey) {
+    $llamaArgs += @("--api-key", $ApiKey)
 }
 
 Write-Host ""
@@ -730,6 +828,27 @@ Write-Host "  显存卸载 :  $Ngl 层  (KV 缓存 $kvType)" -ForegroundColor Da
 Write-Host "  CPU 线程 :  $threads" -ForegroundColor DarkGray
 if ($LoadMode -ne "auto") {
     Write-Host "  加载方式 :  $LoadMode" -ForegroundColor DarkGray
+}
+if ($Lan) {
+    if ($lanIP) {
+        Write-Host "  局域网   :  开   ->   http://${lanIP}:$Port" -ForegroundColor Green
+        Write-Host "              手机/平板连同一个 wifi，浏览器打开上面这个地址即可" -ForegroundColor DarkGray
+        if (-not $ApiKey) {
+            Write-Host "              [注意] 没设钥匙，同一个网络里任何人都能用" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  局域网   :  没找到局域网地址（这台电脑没连路由器）—— 本次只能本机用" -ForegroundColor Yellow
+        $Lan = $false
+    }
+}
+if ($tplFile -and $sysPrompt) {
+    Write-Host "  系统提示 :  开   (客户端没带 system 时补一句「$sysPrompt」)" -ForegroundColor DarkGray
+} elseif ($NoSystemPrompt) {
+    Write-Host "  系统提示 :  关   (-NoSystemPrompt)" -ForegroundColor DarkGray
+}
+if ($tplNote) {
+    Write-Host ""
+    Write-Host "  [注意] $tplNote" -ForegroundColor Yellow
 }
 if ($vramNote) {
     Write-Host ""
@@ -809,59 +928,211 @@ try {
 } catch { }
 
 # ---------------- 8. 启动 ----------------
-$log = Join-Path $DirLog ("server-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
 $url = "http://127.0.0.1:$Port"
+
+# 引擎的日志全部走 stderr，stdout 基本是空的。
+# 以前把 stdout 接到 .log、stderr 接到 .log.err，于是打印给用户的那个 .log
+# 永远是 0 字节 —— 出问题按提示去翻日志，翻到的是空文件。
+# 现在 .log 就是 stderr（真正有内容的那份），stdout 另存 .out 备用。
+$log = Join-Path $DirLog ("server-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+
+# 从引擎日志里认「内存不够」的特征。认得出来才自动降档重试；
+# 认不出来就老实报错 —— 不分青红皂白地重试只会把真正的问题盖住。
+function Test-OutOfMemory([string]$Text) {
+    if (-not $Text) { return $false }
+    $pattern = 'out of memory|OutOfMemory|cudaMalloc failed|cudaErrorMemoryAllocation|' +
+               'failed to allocate|unable to allocate|CUDA error: out of memory|' +
+               'insufficient memory|not enough memory|ggml_backend_.*alloc_buffer.*failed'
+    return ($Text -match $pattern)
+}
+
+# ---- 一行动态进度 ----
+# 秒数来自实测盘速（不是编的常数）；"走到哪一步"来自引擎日志最新一行。
+# 引擎在 47 秒的读取过程里一行都不打，所以只靠日志会像卡死 —— 两个合起来才说明问题。
+$script:ProgW = 78
+try { if ([Console]::WindowWidth -gt 24) { $script:ProgW = [Console]::WindowWidth - 8 } } catch { }
+if ($script:ProgW -gt 100) { $script:ProgW = 100 }
+
+function Show-Progress([double]$Elapsed, [double]$Est, [string]$Phase) {
+    $barW = 24
+    if ($Est -gt 0) {
+        $ratio = $Elapsed / $Est
+        if ($ratio -gt 1) { $ratio = 1 }
+        $full = [int][math]::Round($ratio * $barW)
+        $bar  = ("#" * $full) + ("." * ($barW - $full))
+        $line = "[$bar] {0,4:N0}s / 约{1:N0}s   {2}" -f $Elapsed, $Est, $Phase
+    } else {
+        $line = "{0,4:N0}s   {1}" -f $Elapsed, $Phase
+    }
+    if ($line.Length -gt $script:ProgW) { $line = $line.Substring(0, $script:ProgW) }
+    Write-Host ("`r  " + $line.PadRight($script:ProgW)) -NoNewline
+}
+
+function Clear-Progress {
+    Write-Host ("`r" + (" " * ($script:ProgW + 2)) + "`r") -NoNewline
+}
+
+function Start-Engine {
+    return (Start-Process -FilePath $exe -ArgumentList $llamaArgs `
+            -WorkingDirectory (Split-Path $exe -Parent) `
+            -RedirectStandardOutput ($log + ".out") `
+            -RedirectStandardError  $log `
+            -PassThru -NoNewWindow)
+}
+
+# 返回 "ready" / "died" / "timeout"
+function Wait-Engine([System.Diagnostics.Process]$P, [double]$Est) {
+    $t0 = Get-Date
+    $lastLine = ""
+    for ($i = 0; $i -lt 300; $i++) {
+        Start-Sleep -Milliseconds 700
+        if ($P.HasExited) { return "died" }
+        $elapsed = ((Get-Date) - $t0).TotalSeconds
+
+        $phase = "正在把模型读进内存…（这一步最慢，引擎此时不打日志）"
+        try {
+            $lastLine = Get-Content $log -Tail 1 -ErrorAction SilentlyContinue
+        } catch { }
+        if ($lastLine) {
+            if     ($lastLine -match 'listening on')      { $phase = "引擎已开始监听，正在等它开口…" }
+            elseif ($lastLine -match 'model loaded')      { $phase = "模型已就绪，正在起 HTTP 服务…" }
+            elseif ($lastLine -match 'threadpool init')   { $phase = "文件读完，正在分配计算缓冲…" }
+            elseif ($lastLine -match 'loading model')     { $phase = "正在读模型文件…" }
+        }
+        Show-Progress -Elapsed $elapsed -Est $Est -Phase $phase
+
+        try {
+            $r = Invoke-WebRequest -Uri "$url/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($r.StatusCode -eq 200) { return "ready" }
+        } catch { }
+    }
+    return "timeout"
+}
+
+$ready     = $false
+$proc      = $null
+$crashed   = $false
+$oomTail   = ""
+$attempt   = 0
+$retryNote = @()
+$tplDropped = $false
+
+if ($MaxRetry -lt 0) { $MaxRetry = 0 }
 
 Head "正在启动 AI 引擎"
 Write-Host "  加载 $modelGB GB 模型，$(if ($estSec -gt 0) { "实测本盘预计约 $estSec 秒" } else { "约 10~60 秒" })，请勿关闭本窗口" -ForegroundColor Yellow
 Write-Host "  日志: $log" -ForegroundColor DarkGray
 Write-Host ""
 
-$proc = Start-Process -FilePath $exe -ArgumentList $llamaArgs `
-        -WorkingDirectory (Split-Path $exe -Parent) `
-        -RedirectStandardOutput $log `
-        -RedirectStandardError ($log + ".err") `
-        -PassThru -NoNewWindow
+while ($true) {
+    $attempt++
+    $proc = Start-Engine
+    Clear-Progress
+    $result = Wait-Engine -P $proc -Est $estSec
+    Clear-Progress
 
-Write-Host "  " -NoNewline
-$ready = $false
-for ($i = 0; $i -lt 300; $i++) {
-    Start-Sleep -Seconds 1
-    if ($proc.HasExited) { break }
-    if ($i % 5 -eq 4) { Write-Host "." -NoNewline }
-    try {
-        $r = Invoke-WebRequest -Uri "$url/health" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
-        if ($r.StatusCode -eq 200) { $ready = $true; break }
-    } catch { }
+    if ($result -eq "ready")  { $ready = $true; break }
+    if ($result -eq "timeout") { break }
+
+    # 引擎自己退了。先看是不是内存不够 —— 是的话按档降配重来。
+    try { $oomTail = (Get-Content $log -Tail 60 -ErrorAction SilentlyContinue) -join "`n" } catch { $oomTail = "" }
+    $isOom = Test-OutOfMemory $oomTail
+
+    # 模板加载失败 → 去掉「默认中文」再来一次。模板是按模型名匹配的，万一匹配上
+    # 格式不对的一份，引擎在解析期就直接退出。这时宁可少一个功能，不能让 U 盘起不来。
+    # 只试一次：去掉之后还起不来，就是别的原因，交给下面报错。
+    if ($tplFile -and -not $tplDropped -and
+        ($oomTail -match '(?i)chat template|jinja|failed to parse|template.*error')) {
+        $tplDropped = $true
+        $tplFile    = $null
+        $sysPrompt  = ""
+        $llamaArgs  = Build-Args
+        $retryNote += "模板加载失败，已去掉默认系统提示重试（其余配置不变）。"
+        Write-Host ""
+        Write-Host "  [自动降档] 模型模板加载失败，去掉「默认中文」再试一次……" -ForegroundColor Yellow
+        continue
+    }
+
+    if (-not $isOom -or $attempt -gt $MaxRetry) { $crashed = $true; break }
+
+    # 降档阶梯：先砍上下文；还不行就退到纯 CPU。
+    # 两条路都重新走 Build-Args —— 手抄一份出来，将来加了新开关就会在重试时悄悄少一个。
+    Write-Host ""
+    if ($attempt -eq 1) {
+        $newCtx = [int][math]::Max(8192, [math]::Floor($Ctx / 2))
+        if ($Ctx -le 8192) { $newCtx = 8192 }
+        $retryNote += "第 1 次重试：显存/内存不够，上下文 $Ctx -> $newCtx，KV 缓存精度降到 q4_0。"
+        $Ctx = $newCtx
+        $kvType = "q4_0"
+        $llamaArgs = Build-Args
+        Write-Host "  [自动降档] 显存或内存不够。" -ForegroundColor Yellow
+        Write-Host "             上下文 $Ctx，KV 精度 $kvType，先原后端重试……" -ForegroundColor Yellow
+    } else {
+        $newCtx = [int][math]::Min($Ctx, 8192)
+        $retryNote += "第 2 次重试：显存仍不够，改成纯 CPU 跑（上下文 $Ctx，不往显卡塞层）。"
+        $Ctx = $newCtx
+        $Ngl = 0
+        $backend = "cpu"
+        $backendName = "CPU"
+        $exe = Join-Path (Join-Path $DirLlama "cpu") "llama-server.exe"
+        $llamaArgs = Build-Args
+        Write-Host "  [自动降档] 还是不够。改用纯 CPU + 上下文 $Ctx 重试……" -ForegroundColor Yellow
+    }
+    if (-not (Test-Path $exe)) {
+        $retryNote += "但没找到 $exe，重试无法进行。"
+        $crashed = $true
+        break
+    }
+    Write-Host ""
 }
-Write-Host ""
 
-if ($proc.HasExited -and -not $ready) {
+if ($crashed) {
     Write-Host ""
     Write-Host "  [启动失败] 引擎退出了。错误信息：" -ForegroundColor Red
     Write-Host ""
-    if (Test-Path ($log + ".err")) { Get-Content ($log + ".err") -Tail 25 }
-    if (Test-Path $log)            { Get-Content $log -Tail 25 }
+    if (Test-Path $log) { Get-Content $log -Tail 25 }
     Write-Host ""
+    if ($retryNote.Count -gt 0) {
+        Write-Host "  已经替你试过的自动降档：" -ForegroundColor Yellow
+        foreach ($n in $retryNote) { Write-Host "   - $n" -ForegroundColor Yellow }
+        Write-Host ""
+    }
     Write-Host "  常见原因与对策：" -ForegroundColor Yellow
     Write-Host "   1) 显存不够      -> 双击 高级选项.bat，选 [3] 省显存 / [4] Vulkan / [5] 纯CPU"
     Write-Host "   2) 没装显卡驱动  -> 选 [4] Vulkan 或 [5] 纯CPU"
     Write-Host "   3) 内存太小      -> 选 [5] 纯CPU（mmap 按需分页，比硬塞进显存稳）"
     Write-Host "   4) 杀毒软件拦截  -> 允许 llama-server.exe 运行"
     Write-Host "   5) exe 起不来    -> 见 docs/常见问题.md 的『缺少 DLL』一节"
+    Write-Host "   6) 都不是        -> 日志全文：$log" -ForegroundColor DarkGray
     Wait-Enter
     exit 1
 }
 
 if ($ready) {
     Write-Host ""
+    if ($retryNote.Count -gt 0) {
+        Write-Host "  [自动降档] 起是起来了，但降过配置 —— 记一下：" -ForegroundColor Yellow
+        foreach ($n in $retryNote) { Write-Host "   - $n" -ForegroundColor Yellow }
+        Write-Host ""
+    }
     Write-Host ("=" * 64) -ForegroundColor Green
     Write-Host "   AI 已就绪   ->   $url" -ForegroundColor Green
-    Write-Host "   后端: $backendName" -ForegroundColor Green
+    Write-Host "   后端: $backendName   上下文: $Ctx   KV: $kvType" -ForegroundColor Green
+    if ($Lan -and $lanIP) {
+        Write-Host "" 
+        Write-Host "   手机/平板同一个 wifi 打开： http://${lanIP}:$Port" -ForegroundColor Green
+    }
     Write-Host ("=" * 64) -ForegroundColor Green
     if (-not $NoBrowser) { Start-Process $url }
 } else {
-    Write-Host "  等待超时。引擎可能还在加载，可直接访问 $url" -ForegroundColor Yellow
+    if ($proc -and -not $proc.HasExited) {
+        Write-Host "  等了 5 分钟还没就绪，但引擎进程还活着、也没报错。" -ForegroundColor Yellow
+        Write-Host "  多半是这支盘太慢、或模型偏大。可以直接访问 $url 看看，它可能还在加载。" -ForegroundColor Yellow
+        Write-Host "  也可以现在 Ctrl+C 停下，改用 高级选项.bat 的 [3] 省显存 / [5] 纯CPU 再试。" -ForegroundColor Yellow
+    } else {
+        Write-Host "  等待超时。引擎可能还在加载，可直接访问 $url" -ForegroundColor Yellow
+    }
+    Write-Host "  日志: $log" -ForegroundColor DarkGray
 }
 
 Write-Host ""

@@ -37,6 +37,10 @@ DO_LIST=0
 DO_PROBE=0
 DO_BENCH=0
 OPEN_BROWSER=1
+USE_SYSTEM_PROMPT=1     # 默认替客户端补一句"中文回答"，见下面的 DEFAULT_ZH_PROMPT
+CUSTOM_PROMPT=""        # --system-prompt 传进来的自定义句子
+LAN=0                   # --lan：让同一个 wifi 里的手机也能连
+API_KEY=""              # --api-key：局域网模式下给接口上把锁
 
 # ---------------------------------------------------------------- 输出
 if [ -t 1 ]; then
@@ -101,6 +105,10 @@ show_help() {
   --ngl N              卸载到 GPU 的层数（默认 99）
   --port N             端口（默认 8080）
   --load-mode MODE     加载方式：auto / mmap / none / mlock / mmap+mlock / dio
+  --lan                让同一个 wifi / 局域网里的手机、平板也能连上用
+  --api-key KEY        配合 --lan，给接口加一把钥匙（不加则同网段谁都能用）
+  --no-system-prompt   不补默认的中文系统提示，让模型自己挑语言
+  --system-prompt TEXT 换一句默认系统提示（只在客户端没带 system 时生效）
   --no-browser         启动后不自动开浏览器
   -h, --help           显示这段帮助
 
@@ -108,6 +116,8 @@ show_help() {
   · 模型文件（models/*.gguf）在 Windows 和 macOS / Linux 上通用，不用重下
   · 引擎不通用：各平台要有各自的一份，放在 llama.cpp/<平台>/ 下
   · 缺引擎时本脚本会告诉你该下哪一个，不会去网上乱找
+  · 默认会补一句「中文回答」（借用 templates/ 里该模型自己的模板），
+    客户端带了 system 或用户明说要用别的语言时都不影响
 HELP
 }
 
@@ -148,6 +158,18 @@ while [ $# -gt 0 ]; do
                              exit 1 ;;
                       esac ;;
         --no-browser) OPEN_BROWSER=0 ;;
+        --lan)        LAN=1 ;;
+        --api-key)    shift
+                      case "${1:-}" in
+                          ""|--*) err "--api-key 后面要跟一把钥匙（随便什么字符串）"; printf '\n'; show_help; exit 1 ;;
+                      esac
+                      API_KEY="$1" ;;
+        --no-system-prompt) USE_SYSTEM_PROMPT=0 ;;
+        --system-prompt) shift
+                      case "${1:-}" in
+                          ""|--*) err "--system-prompt 后面要跟一句话"; printf '\n'; show_help; exit 1 ;;
+                      esac
+                      CUSTOM_PROMPT="$1" ;;
         -h|--help)    show_help; exit 0 ;;
         *)            err "不认识的选项：$1"; printf '\n'; show_help; exit 1 ;;
     esac
@@ -476,11 +498,62 @@ fi
 # 那种"看着省了内存其实没省"的误导比不显示更糟。
 KV_SHOWN=""
 
+# ---- 局域网地址（--lan 才需要）----
+# 取「默认路由走的那张网卡」的地址，而不是 ifconfig 里翻出来的第一个 ——
+# 装了 Docker / 虚拟机的人机器上有一堆 172.17.x、192.168.56.x，翻错了给别人一个连不上的地址。
+HOST_ARG="127.0.0.1"
+LAN_IP=""
+if [ "$LAN" = 1 ]; then
+    case "$PLATFORM_OS" in
+        macos)
+            _if="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+            [ -n "$_if" ] && LAN_IP="$(ipconfig getifaddr "$_if" 2>/dev/null)"
+            ;;
+        linux)
+            LAN_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+            ;;
+    esac
+    case "$LAN_IP" in
+        ""|127.*|169.254.*) LAN_IP="" ;;
+    esac
+    if [ -n "$LAN_IP" ]; then
+        HOST_ARG="127.0.0.1,$LAN_IP"
+    else
+        warn "没找到局域网地址（这台电脑没连路由器？）—— 本次只能本机用。"
+        LAN=0
+    fi
+fi
+
+# ---- 默认系统提示 ----
+# 和 Windows 侧同一套做法：引擎没有"默认 system"这种参数，模型的模板里也没有对应变量，
+# 唯一可行的办法是借模型自己那份模板改三行。所以匹配不上就绝不硬套 ——
+# 换了模型还拿旧格式的模板去喂，输出会整段烂掉。
+DEFAULT_ZH_PROMPT="中文回答。回答必须全部是简体中文，不要出现英文单词。"
+TPL_FILE=""
+TPL_NOTE=""
+SYS_PROMPT=""
+if [ "$USE_SYSTEM_PROMPT" = 1 ]; then
+    if [ -n "$CUSTOM_PROMPT" ]; then SYS_PROMPT="$CUSTOM_PROMPT"; else SYS_PROMPT="$DEFAULT_ZH_PROMPT"; fi
+    if [ -d "$ROOT/templates" ]; then
+        for _f in "$ROOT"/templates/*.jinja; do
+            [ -f "$_f" ] || continue
+            _base="$(basename "$_f" .jinja)"
+            case "$MODEL_BASE" in
+                "$_base"*) TPL_FILE="$_f"; break ;;
+            esac
+        done
+    fi
+    if [ -z "$TPL_FILE" ]; then
+        TPL_NOTE="想让模型默认说中文，但 templates/ 里没有匹配 $MODEL_BASE 的模板 —— 本次不注入。"
+        SYS_PROMPT=""
+    fi
+fi
+
 # ---- 拼参数 ----
 set -- \
     -m "$MODEL" \
     --alias "$MODEL_ALIAS" \
-    --host 127.0.0.1 \
+    --host "$HOST_ARG" \
     --port "$PORT" \
     --n-gpu-layers "$NGL" \
     --ctx-size "$CTX" \
@@ -516,6 +589,20 @@ else
     set -- "$@" --no-mmproj
 fi
 
+# 内层引号必须转成 \" 才能穿过引擎的参数解析。少了引号的 JSON 是残废的，引擎直接
+# 报错退出：invalid literal; last read: '{d'; expected string literal —— 这个坑在
+# Windows 侧踩过一次，两边都得转。
+if [ -n "$TPL_FILE" ] && [ -n "$SYS_PROMPT" ]; then
+    KW="$(printf '{"default_system":"%s"}' "$SYS_PROMPT" | sed 's/"/\\"/g')"
+    set -- "$@" --chat-template-file "$TPL_FILE" --chat-template-kwargs "$KW"
+fi
+
+# 引擎没设钥匙时会自己打一行 "no API key is set and CORS allows all origins"。
+# 只在本机跑无所谓；一旦开了局域网，同一个 wifi 下谁都能用。
+if [ "$LAN" = 1 ] && [ -n "$API_KEY" ]; then
+    set -- "$@" --api-key "$API_KEY"
+fi
+
 printf '\n'
 printf '  %s上下文   : %s tokens%s\n' "$C_DIM" "$CTX" "$C_OFF"
 printf '  显存卸载 : %s 层\n' "$NGL"
@@ -527,6 +614,17 @@ fi
 printf '  CPU 线程 : %s  (本机 %s 核)\n' "$THREADS" "$CPU_CORES"
 printf '  内存     : %s GB\n' "$RAM_GB"
 [ "$LOAD_MODE" != "auto" ] && printf '  加载方式 : %s %s\n' "$LOAD_MODE" "$LOAD_NOTE"
+if [ "$LAN" = 1 ]; then
+    printf '  局域网   : 开   ->   http://%s:%s\n' "$LAN_IP" "$PORT"
+    printf '              %s手机/平板连同一个 wifi，浏览器打开上面这个地址%s\n' "$C_DIM" "$C_OFF"
+    [ -z "$API_KEY" ] && printf '              %s[注意] 没设钥匙，同一个网络里任何人都能用%s\n' "$C_WARN" "$C_OFF"
+fi
+if [ -n "$TPL_FILE" ] && [ -n "$SYS_PROMPT" ]; then
+    printf '  系统提示 : 开   %s(客户端没带 system 时补：%s)%s\n' "$C_DIM" "$SYS_PROMPT" "$C_OFF"
+elif [ "$USE_SYSTEM_PROMPT" = 0 ]; then
+    printf '  系统提示 : 关   %s(--no-system-prompt)%s\n' "$C_DIM" "$C_OFF"
+fi
+[ -n "$TPL_NOTE" ] && printf '\n  %s[注意] %s%s\n' "$C_WARN" "$TPL_NOTE" "$C_OFF"
 
 if [ "$DO_PROBE" = 1 ]; then
     head_line "探测完成（没有真的启动引擎）"

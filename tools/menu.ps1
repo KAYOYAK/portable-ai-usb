@@ -85,6 +85,8 @@ function Show-Menu {
     Write-Host "    [10] 选择使用哪个模型  (models\ 下有多个时)"
     Write-Host "    [11] 测一下这支 U 盘的速度  (看看要等多久)"
     Write-Host "    [12] 启动  -  不用 mmap  (慢盘卡顿时用, 占内存)"
+    Write-Host "    [13] 启动  -  关掉默认说中文  (让模型自己挑语言)"
+    Write-Host "    [14] 启动  -  局域网模式  (手机、平板连同一个 wifi 也能用)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -216,6 +218,27 @@ while ($true) {
             # 兜底：慢盘上 mmap 按需分页会卡，改成整块读进内存。
             # launcher 自己会检查内存装不装得下，装不下会改回 auto 并说明原因。
             & $Launcher -LoadMode none
+        }
+        "13" {
+            # 关掉「默认说中文」。模型会按自己的脾气挑语言 ——
+            # 想要中英混杂、或者想自己用提示词控制语言时用。
+            & $Launcher -NoSystemPrompt
+        }
+        "14" {
+            # 局域网：手机、平板连同一个 wifi 就能用。
+            # 这里不问要不要钥匙 —— 要走键盘输入的都在 launcher 里，
+            # 而这里被 Read-Choice 占着；要钥匙的人在命令行加 -ApiKey。
+            Clear-Safe
+            Write-Host ""
+            Write-Host "  局域网模式：这台电脑会同时监听 127.0.0.1 和局域网地址。" -ForegroundColor Yellow
+            Write-Host "  同一个 wifi 下的手机、平板能打开它显示的地址。" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  [注意] 没设钥匙，同一个网络里任何人都能用。" -ForegroundColor Yellow
+            Write-Host "         想加钥匙：高级选项.bat 换成命令行跑" -ForegroundColor DarkGray
+            Write-Host "         powershell -ExecutionPolicy Bypass -File launcher.ps1 -Lan -ApiKey 你的钥匙" -ForegroundColor DarkGray
+            Write-Host ""
+            Pause-Safe
+            & $Launcher -Lan
         }
         "0" { exit 0 }
         "q" { exit 0 }
