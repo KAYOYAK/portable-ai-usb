@@ -162,6 +162,15 @@ if ($models.Count -gt 0) {
                 F "$($m.Name) 读不出来：$($_.Exception.Message)"
             }
         }
+        # 清单里有、盘上已经没有的 —— 通常是从菜单 [18] 删了模型，而那时清单
+        # 没跟着更新。不报的话这份清单会一直写着「记了 N 个模型」，其中几个早没了。
+        $onDisk = @{}
+        foreach ($m in $models) { $onDisk[$m.Name] = $true }
+        $ghost = @($known.Keys | Where-Object { -not $onDisk.ContainsKey($_) })
+        if ($ghost.Count -gt 0) {
+            W "校验清单里有 $($ghost.Count) 个模型，盘上已经没有了： $($ghost -join ', ')"
+            I "删模型之后清单没跟着更新。跑一次 tools\准备U盘.ps1 会把清单重写干净。"
+        }
     }
 }
 

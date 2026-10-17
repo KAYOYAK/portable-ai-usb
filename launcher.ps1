@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.11.0"
+$AppVersion = "1.11.1"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -615,7 +615,10 @@ if ($Bench) {
 $cores = 0
 try { $cores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum } catch { }
 if (-not $cores -or $cores -lt 1) { $cores = [Environment]::ProcessorCount }
-$threads = [math]::Max(2, $cores)
+# 上限 8：三份文档都写着「默认按核数自动（上限 8）」，启动AI.sh 也一直是
+# `CPU_CORES > 8 ? 8 : CPU_CORES`，只有这里漏了 —— 16 核机器上会开 16 线程，
+# 而 llama.cpp 超过物理核数通常只会更慢、更热。
+$threads = [math]::Min(8, [math]::Max(2, $cores))
 
 $ramGB = 0
 try { $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1) } catch { }
@@ -1010,7 +1013,7 @@ function Inv([double]$v) { return $v.ToString([System.Globalization.CultureInfo]
 
 # 线程数。0 = 自动，用上面按核数算出来的那个。纯 CPU 兜底时这是唯一还能救一下的旋钮 ——
 # OOM 降档到 CPU 之后速度几乎完全由它决定，而以前它被写死在核数上，用户改不了。
-$threads = if ([int]$sample.threads -gt 0) { [int]$sample.threads } else { [math]::Max(2, $cores) }
+$threads = if ([int]$sample.threads -gt 0) { [int]$sample.threads } else { [math]::Min(8, [math]::Max(2, $cores)) }
 
 # ---------------- 6.4 让 AI 读文件 ----------------
 # 引擎自己的内置工具。开了以后：客户端带 tools 数组发请求 → 模型回一个 tool_call →
@@ -1087,6 +1090,12 @@ function Get-FileStamp([string]$Dir) {
 }
 
 if ($AllowWrite -and $toolDir) {
+    # -NoSnapshot 要真的跳过备份。以前这个开关只写在帮助里、提示文案里也提到它，
+    # 但这里的判断根本没看它 —— 用户加了开关照样整目录复制，白等一遍。
+    if ($NoSnapshot) {
+        $snapDir    = $null      # 显式清掉，下面 Show-WorkspaceDiff 靠它判断"这次没备份"
+        $snapBefore = Get-FileStamp $toolDir
+    } else {
     try {
         $snapDir = Join-Path $toolDir (".backup\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
         New-Item -ItemType Directory -Force -Path $snapDir | Out-Null
@@ -1098,22 +1107,31 @@ if ($AllowWrite -and $toolDir) {
             Write-Host "         只备份前 500 个且总量不超过 500 MB。没备份到的改动，关掉时只能看见、退不回。" -ForegroundColor Yellow
         }
         $copied = 0
+        $copiedBytes = 0
         foreach ($f in $files) {
             if ($copied -ge 500) { break }
+            # 体积上限同样要真拦。原来只判数量，文案却写着「总量不超过 500 MB」——
+            # 400 个文件共 2 GB 时会照单全收，复制几分钟、把盘吃满，然后才轮到人发现。
+            if (($copiedBytes + $f.Length) -gt 500MB) { break }
             $rel = $f.FullName.Substring($toolDir.Length).TrimStart('\')
             $dst = Join-Path $snapDir $rel
             $d   = Split-Path -Parent $dst
             if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
             Copy-Item -LiteralPath $f.FullName -Destination $dst -Force -ErrorAction SilentlyContinue
             $copied++
+            $copiedBytes += $f.Length
         }
         if ($copied -gt 0) {
-            Write-Host "  已备份 :  $copied 个文件 -> $snapDir" -ForegroundColor DarkGray
+            Write-Host ("  已备份 :  {0} 个文件 / {1:N1} MB -> {2}" -f $copied, ($copiedBytes / 1MB), $snapDir) -ForegroundColor DarkGray
+        }
+        if ($copied -lt $files.Count) {
+            Write-Host ("         还有 {0} 个文件没备份（超出上限），那些改动退不回去。" -f ($files.Count - $copied)) -ForegroundColor Yellow
         }
     } catch {
         $snapDir = $null
     }
     $snapBefore = Get-FileStamp $toolDir
+    }
 }
 
 # 关掉时调一次。引擎退出、Ctrl+C、异常退出都走这里（写在最外层，
@@ -1287,9 +1305,21 @@ try {
 # 参数要拼两次：第一次按原配置，降档重试时按新配置。只留这一份拼装逻辑 ——
 # 之前降档那段是手抄一遍的，后来加的开关（多模态、默认系统提示、局域网钥匙）
 # 少抄一个就会在重试时悄悄失效，这种漏抄没人看得出来。
+
+# Start-Process 的 -ArgumentList 是「按空格 join」，它不会替你给每个参数加引号。
+# 所以只要路径里带空格（比如有人把 U 盘内容拷到 "D:\my ai usb\"），
+#   -m D:\my ai usb\models\x.gguf
+# 会被引擎当成两个参数，直接起不来，报的还是「找不到模型」这种牛头不对马嘴的话。
+# 只给「一定是路径」的那几个套引号，不做通用处理 —— --chat-template-kwargs
+# 那段是 JSON、自己已经包了一层，再套会变成双份引号。
+function Q([string]$s) {
+    if ($s -and $s -match '\s') { return ('"' + $s + '"') }
+    return $s
+}
+
 function Build-Args {
     $a = @(
-        "-m", $model.FullName,
+        "-m", (Q $model.FullName),
         "--alias", $alias,
         "--host", $lanArg,
         "--port", "$Port",
@@ -1312,7 +1342,7 @@ function Build-Args {
         $a += @("--n-gpu-layers", "$Ngl")
     }
     if ($promptDir) {
-        $a += @("--log-prompts-dir", $promptDir)
+        $a += @("--log-prompts-dir", (Q $promptDir))
     }
     # 纯 CPU 跑时没有 CUDA/Vulkan 后端，--flash-attn 和 KV 量化都是显卡侧的东西。
     if ($backend -ne "cpu") {
@@ -1322,7 +1352,7 @@ function Build-Args {
         $a += @("-lm", $LoadMode)
     }
     if ($mmproj) {
-        $a += @("-mm", $mmproj.FullName)
+        $a += @("-mm", (Q $mmproj.FullName))
     } else {
         $a += @("--no-mmproj")
     }
@@ -1337,7 +1367,7 @@ function Build-Args {
     # 短提示里全是中文标点、没有空格，所以这个坑一直没露头。
     if ($sysPrompt -and $tplFile) {
         $kw = (@{ default_system = $sysPrompt } | ConvertTo-Json -Compress) -replace '"', '\"'
-        $a += @("--chat-template-file", $tplFile, "--chat-template-kwargs", ('"{0}"' -f $kw))
+        $a += @("--chat-template-file", (Q $tplFile), "--chat-template-kwargs", ('"{0}"' -f $kw))
     }
     # 内置工具。名字必须和引擎的清单完全一致，写错一个引擎会直接报错退出。
     if ($toolsOn) {
@@ -1444,6 +1474,11 @@ if ($loadNote) {
 # 不然文件里写的还是降档前的配置。
 $settingsPath = Join-Path $Root "当前设置.txt"
 function Write-Settings {
+    # -Probe（菜单 [6]「仅检测硬件」走的就是它）和 -CheckUpdate 都不能写这份文件。
+    # 那两次运行没有 -AllowWrite，写进去的是「没开工具、没开写盘」的配置 ——
+    # 用户点一下「仅检测硬件」，回头打开 当前设置.txt 看到的就是假配置，
+    # 连引擎命令行都会少掉 --tools 那一截。它们的结果打在屏幕上就够了。
+    if ($Probe -or $CheckUpdate) { return }
     try {
         $lines = @(
             "U盘 AI 便携版 —— 当前设置",

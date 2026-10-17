@@ -665,6 +665,27 @@ while ($true) {
                                 Write-Host ""
                                 Write-Host "  它原本是「当前」模型，已把 当前模型.txt 清掉 —— 下次启动自动挑最大的。" -ForegroundColor Yellow
                             }
+                            # models\校验.txt 里那一行也要删。清单是 tools\自检.ps1 的唯一
+                            # 基准，删了文件不删记录，自检会一直在「记了 N 个模型」里算着
+                            # 已经不存在的这一个。删失败不影响文件已经删掉这件事，说一声即可。
+                            $mf = Join-Path $dirModels "校验.txt"
+                            if (Test-Path $mf) {
+                                try {
+                                    $lines = @(Get-Content $mf -Encoding UTF8 -ErrorAction SilentlyContinue)
+                                    $keep  = @()
+                                    $hit   = $false
+                                    foreach ($ln in $lines) {
+                                        $mm = [regex]::Match($ln, '^\s*[0-9a-fA-F]{64}\s+\d+\s+(.+?)\s*$')
+                                        if ($mm.Success -and $mm.Groups[1].Value -eq $m.Name) { $hit = $true; continue }
+                                        $keep += $ln
+                                    }
+                                    if ($hit) {
+                                        [IO.File]::WriteAllText($mf, ($keep -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+                                    }
+                                } catch {
+                                    Write-Host "  [注意] 校验清单没更新成，自检会把这条当成「盘上已没有」。" -ForegroundColor Yellow
+                                }
+                            }
                             Write-Host ""
                             Write-Host "  已删除：$($m.Name)" -ForegroundColor Green
                         } catch {

@@ -819,7 +819,16 @@ _conv_prompt() {
     # 存档按次落盘到 logs/对话/<时间戳>.txt，不再每次覆盖同一个文件 ——
     # 以前只留一份「上次对话」，聊完 A 事再聊 B 事，A 就没了。
     # 时间戳取那份 prompt 的 mtime：同一次运行里不会重复生成。
-    _stamp="$(date -r "$_newest" '+%Y-%m-%d-%H%M%S' 2>/dev/null || date '+%Y-%m-%d-%H%M%S')"
+    # 时间戳取那份 prompt 的 mtime。GNU date 的 -r 要的是文件、BSD（macOS）的 -r
+    # 要的是秒数 —— 原来直接写 `date -r 文件`，在 Mac 上会静默跌到 fallback，
+    # 存档文件名就成了"这次启动的时间"，和那次对话对不上。先取秒数再格式化，
+    # 两边都能走。
+    _mt="$(stat -c %Y "$_newest" 2>/dev/null || stat -f %m "$_newest" 2>/dev/null || echo 0)"
+    if [ "${_mt:-0}" -gt 0 ] 2>/dev/null; then
+        _stamp="$(date -r "$_mt" '+%Y-%m-%d-%H%M%S' 2>/dev/null || date -d "@$_mt" '+%Y-%m-%d-%H%M%S' 2>/dev/null || date '+%Y-%m-%d-%H%M%S')"
+    else
+        _stamp="$(date '+%Y-%m-%d-%H%M%S')"
+    fi
     _cdir="$ROOT/logs/对话"
     mkdir -p "$_cdir" 2>/dev/null || _cdir=""
     {
