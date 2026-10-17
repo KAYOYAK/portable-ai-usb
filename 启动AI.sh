@@ -564,12 +564,25 @@ elif [ -r /proc/meminfo ]; then
 fi
 [ -n "$RAM_GB" ] || RAM_GB=0
 
+# 模型大小。之前下面启动横幅里 printf 用了 $MODEL_GB，但这个变量从来没被赋值过 ——
+# Linux / macOS 上一直打出「模型 : xxx.gguf   ( GB)」，括号里是空的。
+_model_bytes="$(stat -c %s "$MODEL" 2>/dev/null || stat -f %z "$MODEL" 2>/dev/null || echo 0)"
+MODEL_GB="$(awk -v b="$_model_bytes" 'BEGIN{printf "%.1f", b/1073741824}')"
+
+# 显存：和 Windows 那边同一个来源（nvidia-smi）。拿不到就当 0，不猜 ——
+# 猜大了的后果是显存不足直接崩，比不优化更糟。macOS 走统一内存，另算。
+VRAM_GB=0
+if [ "$PLATFORM_OS" != "macos" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null |
+               head -n 1 | awk '{printf "%.0f", $1/1024}')"
+fi
+[ -n "$VRAM_GB" ] || VRAM_GB=0
+
 # macOS 走 Metal（统一内存），Linux 上看引擎是哪份：vulkan/cuda 才真能卸载
+_auto_ngl=0
 if [ -z "$NGL" ]; then
-    case "$ENGINE" in
-        *vulkan*|*cuda*|*macos*) NGL=99 ;;
-        *) NGL=99 ;;
-    esac
+    _auto_ngl=1      # 用户没显式给，后面显存装不下时允许改成让引擎自己定
+    NGL=99
 fi
 
 if [ -z "$CTX" ]; then
@@ -580,6 +593,24 @@ KV_TYPE="q8_0"
 if [ "$RAM_GB" -gt 0 ] 2>/dev/null && [ "$RAM_GB" -lt 12 ] 2>/dev/null; then
     KV_TYPE="q4_0"
 fi
+
+# ---- 显存够不够装：模型 + KV 缓存 + 计算缓冲 ----
+# 上面按"内存多大"定上下文，从没算过模型本身多大。同一张 8 GB 卡，6.4 GB 的模型
+# 给 99 层正好，14 GB 的模型还是 99 层，开跑就 OOM —— 报错还指向别处。
+VRAM_AUTOFIT=0
+VRAM_FIT_NOTE=""
+if [ "$_auto_ngl" = 1 ] && [ "$VRAM_GB" -gt 0 ] 2>/dev/null && [ "$PLATFORM_OS" != "macos" ]; then
+    case "$KV_TYPE" in q4_0) _kvkb=8 ;; q8_0) _kvkb=16 ;; *) _kvkb=32 ;; esac
+    _need="$(awk -v m="$MODEL_GB" -v c="$CTX" -v k="$_kvkb" \
+        'BEGIN{printf "%.1f", m + c*k/1048576 + 1.2}')"
+    if awk -v n="$_need" -v v="$VRAM_GB" 'BEGIN{exit !(n > v)}'; then
+        # 与其我们猜"该放几层"（猜错了照样崩），不如不传 -ngl、交给 --fit on：
+        # 引擎自己知道真实层数和每层张量大小，比按文件大小比例算准。
+        VRAM_AUTOFIT=1
+        VRAM_FIT_NOTE="模型 $MODEL_GB GB + KV 装不下 $VRAM_GB GB 显存（需要约 $_need GB）—— 不再硬塞 99 层，改由引擎自己决定放多少层进显卡。会慢一些，但不会一开就崩。"
+    fi
+fi
+if [ "$VRAM_AUTOFIT" = 1 ]; then NGL_LABEL="自动（模型比显存大，按实际显存放）"; else NGL_LABEL="$NGL 层"; fi
 # 真正传给引擎的 KV 量化，和上面"打算用哪种"是两件事：
 # --cache-type-* 只有 vulkan / cuda 那两份引擎带，macOS 走 Metal 不传。
 # 显示的时候必须看这个，否则会在 Mac 上打出"KV 缓存 q4_0"而实际没生效 —— 
@@ -737,8 +768,14 @@ _conv_prompt() {
             print
         }' "$_newest" | cat -s | sed -e '/./,$!d')"
     [ -n "$_body" ] || return 0
+    # 存档按次落盘到 logs/对话/<时间戳>.txt，不再每次覆盖同一个文件 ——
+    # 以前只留一份「上次对话」，聊完 A 事再聊 B 事，A 就没了。
+    # 时间戳取那份 prompt 的 mtime：同一次运行里不会重复生成。
+    _stamp="$(date -r "$_newest" '+%Y-%m-%d-%H%M%S' 2>/dev/null || date '+%Y-%m-%d-%H%M%S')"
+    _cdir="$ROOT/logs/对话"
+    mkdir -p "$_cdir" 2>/dev/null || _cdir=""
     {
-        printf '上一次运行时聊的内容（从引擎的 prompt 记录还原）\n'
+        printf '这次运行时聊的内容（从引擎的 prompt 记录还原）\n'
         printf '记录时间：%s\n\n' "$(date '+%Y-%m-%d %H:%M')"
         printf '两点说明：\n'
         printf '  1. 引擎是「发送前」记的，所以最后一句 AI 回答不在里面。\n'
@@ -746,7 +783,15 @@ _conv_prompt() {
         printf '========================================================\n'
         printf '%s\n' "$_body"
     } > "$ROOT/logs/上次对话.txt"
-    info "上次聊的内容已存到 logs/上次对话.txt（能回看，导不回界面）"
+    if [ -n "$_cdir" ]; then
+        cp -f "$ROOT/logs/上次对话.txt" "$_cdir/$_stamp.txt" 2>/dev/null || true
+        # 只留最近 30 份。U 盘空间有限，也没人去翻第 31 次之前聊的什么。
+        _old="$(ls -t "$_cdir"/*.txt 2>/dev/null | tail -n +31)"
+        if [ -n "$_old" ]; then echo "$_old" | while read -r _f; do rm -f "$_f"; done; fi
+        info "这次聊的内容已存到 logs/对话/$_stamp.txt（能回看，导不回界面）"
+    else
+        info "上次聊的内容已存到 logs/上次对话.txt（能回看，导不回界面）"
+    fi
 }
 
 PROMPT_DIR="$ROOT/logs/prompts"
@@ -757,12 +802,15 @@ if [ -n "$PROMPT_DIR" ]; then
 fi
 
 # ---- 拼参数 ----
+# 装不下就整个不传 -ngl，配 --fit on 让引擎按真实显存定层数（-c 是我们指定的，
+# --fit 只调"没指定的参数"，所以上下文不会被它偷偷改小）。
+if [ "$VRAM_AUTOFIT" = 1 ]; then _NGL_ARGS="--fit on"; else _NGL_ARGS="--n-gpu-layers $NGL"; fi
 set -- \
     -m "$MODEL" \
     --alias "$MODEL_ALIAS" \
     --host "$HOST_ARG" \
     --port "$PORT" \
-    --n-gpu-layers "$NGL" \
+    $_NGL_ARGS \
     --ctx-size "$CTX" \
     --threads "$THREADS" \
     --jinja \
@@ -826,7 +874,7 @@ _rounds=$((CTX / 1100))
 if [ "$_rounds" -ge 3 ]; then
     printf '              %s大约能聊 %s~%s 轮，之后会开始忘掉最早的对话%s\n' "$C_DIM" "$((_rounds * 8 / 10))" "$_rounds" "$C_OFF"
 fi
-printf '  显存卸载 : %s 层\n' "$NGL"
+printf '  显存卸载 : %s\n' "$NGL_LABEL"
 if [ -n "$KV_SHOWN" ]; then
     printf '  KV 缓存  : %s\n' "$KV_SHOWN"
 else
@@ -847,6 +895,7 @@ elif [ "$USE_SYSTEM_PROMPT" = 0 ]; then
     printf '  系统提示 : 关   %s(--no-system-prompt)%s\n' "$C_DIM" "$C_OFF"
 fi
 [ -n "$TPL_NOTE" ] && printf '\n  %s[注意] %s%s\n' "$C_WARN" "$TPL_NOTE" "$C_OFF"
+[ -n "$VRAM_FIT_NOTE" ] && printf '\n  %s[注意] %s%s\n' "$C_WARN" "$VRAM_FIT_NOTE" "$C_OFF"
 if [ "$TOOLS_ON" = 1 ]; then
     if [ "$ALLOW_WRITE" = 1 ]; then _scope="读 + 写（不含执行命令）"; else _scope="只读"; fi
     printf '  读文件   :  开   %s(%s)%s   ->   %s\n' "$C_DIM" "$_scope" "$C_OFF" "$TOOL_DIR"
@@ -871,7 +920,7 @@ _write_settings() {
         printf '模型     :  %s   (%s GB)\n' "$MODEL_BASE" "$MODEL_GB"
         printf '加速方式 :  %s\n' "$BACKEND_FULL"
         printf '上下文   :  %s tokens\n' "$CTX"
-        printf '显存卸载 :  %s 层   (KV 缓存 %s)\n' "$NGL" "${KV_SHOWN:-默认}"
+        printf '显存卸载 :  %s   (KV 缓存 %s)\n' "$NGL_LABEL" "${KV_SHOWN:-默认}"
         printf 'CPU 线程 :  %s\n' "$THREADS"
         printf '加载方式 :  %s\n' "$LOAD_MODE"
         printf '端口     :  %s%s\n' "$PORT" "$([ -n "$PORT_FROM" ] && printf '   （来源：%s）' "$PORT_FROM")"
@@ -1066,6 +1115,18 @@ if [ "$OPEN_BROWSER" = 1 ] || [ "$NO_SPEED_TEST" = 0 ]; then
                             printf '单位说明：1 token 约等于 0.6~1 个汉字，或约 0.75 个英文单词。\n'
                             printf 'tools/反馈报告.ps1 会自动读这个文件，不用你手填。\n'
                         } > "$ROOT/logs/速度.txt" 2>/dev/null || true
+                        # 再往 速度历史.txt 追加一行 —— 上面那份每次都覆盖，
+                        # 「今天是不是比昨天慢 / 这支盘是不是老化了」就没处查。
+                        {
+                            _hf="$ROOT/logs/速度历史.txt"
+                            [ -f "$_hf" ] || printf '每次启动实测的速度（一行一次，只留最近 50 条；详情看 速度.txt）\n' > "$_hf"
+                            printf '%s  %s  %s tok/s  提示 %s tok/s  %s  ctx %s\n' \
+                                "$(date '+%Y-%m-%d %H:%M')" "$(basename "$MODEL")" "$_pps" "${_pq:-?}" "$BACKEND" "$CTX" >> "$_hf"
+                            _hc="$(wc -l < "$_hf" 2>/dev/null || echo 0)"
+                            if [ "$_hc" -gt 51 ] 2>/dev/null; then
+                                { head -n 1 "$_hf"; tail -n 50 "$_hf"; } > "$_hf.tmp" && mv -f "$_hf.tmp" "$_hf"
+                            fi
+                        } 2>/dev/null || true
                     fi
                 fi
                 # 工具链自检。/tools 是一张独立的表：`--tools` 能打开不等于这张表

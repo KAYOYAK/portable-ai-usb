@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.8.0"
+$AppVersion = "1.9.0"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -710,6 +710,7 @@ $backendName = @{
 Write-Host "  已选后端 :  $backendName" -ForegroundColor Green
 
 # ---------------- 5. 按显存 + 内存自动配上下文与卸载层数 ----------------
+$nglExplicit = ($Ngl -ge 0)   # 用户自己用 -Ngl 指定过，那就别替他改
 if ($Ngl -lt 0) {
     if ($backend -eq "cpu") { $Ngl = 0 } else { $Ngl = 99 }
 }
@@ -754,6 +755,31 @@ if ($ramTiny) {
 } elseif ($ramTight) {
     if ($Ctx -gt 16384) { $Ctx = 16384 }
     $ramNote = "内存 $ramGB GB 比较紧（模型 $modelGB GB），已把上下文压到 $Ctx 以减少换页。"
+}
+
+# ---- 显存够不够装：模型 + KV 缓存 + 计算缓冲 ----
+# 上面那段只按"显存多大"决定上下文，从没算过"模型本身多大" —— 同一张 8 GB 卡，
+# 6.4 GB 的模型给 99 层正好，换 14 GB 的模型还是给 99 层，然后开跑就 OOM。
+# 更糟的是报错指向别处（见下面的崩溃提示：「显存被别的程序抢了」），
+# 用户关掉一堆程序重试，一样崩。内存那边早就按 $modelGB 算过了，显存这边漏了。
+$vramFitNote = $null
+$vramAutoFit = $false
+if ($backend -ne "cpu" -and $nvVramGB -gt 0) {
+    $kvPerTokKB = @{ 'f16' = 32; 'q8_0' = 16; 'q4_0' = 8 }[$kvType]
+    $kvGB = $Ctx * $kvPerTokKB / 1MB          # KB → GB
+    $overheadGB = 1.2                         # 计算缓冲 + 驱动自己占的
+    $needGB  = [math]::Round($modelGB + $kvGB + $overheadGB, 1)
+    if ($needGB -gt $nvVramGB) {
+        $over = [math]::Round($needGB - $nvVramGB, 1)
+        if ($nglExplicit) {
+            $vramFitNote = "模型 $modelGB GB + KV $([math]::Round($kvGB,1)) GB 装不下 $nvVramGB GB 显存（差 $over GB），但你手动指定了 -Ngl $Ngl，按你的来。"
+        } else {
+            # 与其我们猜"该放几层"（猜错了照样崩），不如把 -ngl 去掉、交给 --fit on：
+            # 引擎自己知道真实层数和每层的张量大小，比按文件大小比例算准。
+            $vramAutoFit = $true
+            $vramFitNote = "模型 $modelGB GB + KV $([math]::Round($kvGB,1)) GB 装不下 $nvVramGB GB 显存（差 $over GB）—— 不再硬塞 99 层，改由引擎自己决定放多少层进显卡。会慢一些，但不会一开就崩。"
+        }
+    }
 }
 
 # 不用 mlock：内存紧张的机器上 mlock 会把可用内存锁死。
@@ -1163,9 +1189,16 @@ function Save-LastChat {
         $t = $t -replace '<\|im_start\|>\s*[A-Za-z_]+\s*', "`r`n"
         $t = $t.Trim()
         if (-not $t) { return }
-        $out = Join-Path $Root "logs\上次对话.txt"
+        # 存档落到 logs\对话\<时间戳>.txt，而不是每次都覆盖同一个文件。
+        # 以前只留一份「上次对话」，聊完 A 事再聊 B 事，A 就没了 —— U 盘 AI 是
+        # 长期用的东西，等于没有记忆。时间戳取那份 prompt 的时间：同一次运行里
+        # 存两次（收摊前、清空 prompts 前）会落到同一个文件名，不会重复堆垃圾。
+        $stamp   = $newest.LastWriteTime.ToString('yyyy-MM-dd-HHmmss')
+        $chatDir = Join-Path $Root "logs\对话"
+        try { New-Item -ItemType Directory -Path $chatDir -Force -ErrorAction Stop | Out-Null } catch { }
+        $out = Join-Path $chatDir "$stamp.txt"
         $head = (@(
-            "上一次运行时聊的内容（从引擎的 prompt 记录还原）"
+            "这次运行时聊的内容（从引擎的 prompt 记录还原）"
             "记录时间：$($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
             ""
             "两点说明："
@@ -1174,8 +1207,20 @@ function Save-LastChat {
             ("=" * 56)
             ""
         )) -join "`r`n"
-        [IO.File]::WriteAllText($out, $head + $t + "`r`n", (New-Object Text.UTF8Encoding($true)))
-        Write-Host "  上次对话已存到 logs\上次对话.txt（能回看，导不回界面）" -ForegroundColor DarkGray
+        $full = $head + $t + "`r`n"
+        [IO.File]::WriteAllText($out, $full, (New-Object Text.UTF8Encoding($true)))
+        # 再放一份最新的到 logs\上次对话.txt：菜单、README、使用说明里都写着这个路径，
+        # 别为了加历史让原来那条路失效。
+        try {
+            [IO.File]::WriteAllText((Join-Path $Root "logs\上次对话.txt"), $full, (New-Object Text.UTF8Encoding($true)))
+        } catch { }
+        # 只留最近 30 份。U 盘空间有限，而且没人会去翻第 31 次之前聊的什么。
+        try {
+            $old = @(Get-ChildItem $chatDir -Filter "*.txt" -File -ErrorAction SilentlyContinue |
+                     Sort-Object LastWriteTime -Descending | Select-Object -Skip 30)
+            foreach ($f in $old) { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue }
+        } catch { }
+        Write-Host "  这次对话已存到 logs\对话\$stamp.txt（能回看，导不回界面）" -ForegroundColor DarkGray
     } catch { }
 }
 
@@ -1205,7 +1250,6 @@ function Build-Args {
         "--alias", $alias,
         "--host", $lanArg,
         "--port", "$Port",
-        "--n-gpu-layers", "$Ngl",
         "--ctx-size", "$Ctx",
         "--threads", "$threads",
         "--jinja",
@@ -1217,6 +1261,13 @@ function Build-Args {
         "--repeat-penalty", (Inv $sample.repeat_penalty),
         "--n-predict", "$([int]$sample.n_predict)"
     )
+    if ($vramAutoFit) {
+        # 不传 -ngl，配合 --fit on：llama.cpp 会把「没指定的参数」按真实显存调整。
+        # -c 是我们指定的，所以上下文不会被它偷偷改小。
+        $a += @("--fit", "on")
+    } else {
+        $a += @("--n-gpu-layers", "$Ngl")
+    }
     if ($promptDir) {
         $a += @("--log-prompts-dir", $promptDir)
     }
@@ -1282,7 +1333,8 @@ $rounds = [math]::Floor($Ctx / 1100)
 if ($rounds -ge 3) {
     Write-Host "              大约能聊 $([math]::Floor($rounds*0.8))~$rounds 轮，之后会开始忘掉最早的对话" -ForegroundColor DarkGray
 }
-Write-Host "  显存卸载 :  $Ngl 层  (KV 缓存 $kvType)" -ForegroundColor DarkGray
+$nglLabel = if ($vramAutoFit) { "自动（模型比显存大，按实际显存放）" } else { "$Ngl 层" }
+Write-Host "  显存卸载 :  $nglLabel  (KV 缓存 $kvType)" -ForegroundColor DarkGray
 Write-Host "  CPU 线程 :  $threads" -ForegroundColor DarkGray
 Write-Host "  端口     :  $Port$(if ($portFrom) { "   （来源：$portFrom）" })" -ForegroundColor DarkGray
 Write-Host "  采样     :  temp $(Inv $sample.temp) / top_p $(Inv $sample.top_p) / top_k $([int]$sample.top_k) / min_p $(Inv $sample.min_p)" -ForegroundColor DarkGray
@@ -1329,6 +1381,10 @@ if ($vramNote) {
     Write-Host ""
     Write-Host "  [注意] $vramNote" -ForegroundColor Yellow
 }
+if ($vramFitNote) {
+    Write-Host ""
+    Write-Host "  [注意] $vramFitNote" -ForegroundColor Yellow
+}
 if ($ramNote) {
     Write-Host ""
     Write-Host "  [注意] $ramNote" -ForegroundColor Yellow
@@ -1356,7 +1412,7 @@ function Write-Settings {
             "模型     :  $($model.Name)   ($([math]::Round($modelGB,2)) GB)",
             "加速方式 :  $backendName",
             "上下文   :  $Ctx tokens",
-            "显存卸载 :  $Ngl 层   (KV 缓存 $kvType)",
+            "显存卸载 :  $nglLabel   (KV 缓存 $kvType)",
             "CPU 线程 :  $threads",
             "加载方式 :  $(if ($LoadMode -eq 'auto') { 'auto（按需分页，省内存）' } else { $LoadMode })",
             "端口     :  $Port$(if ($portFrom) { "   （来源：$portFrom）" })",
@@ -1858,6 +1914,25 @@ if ($ready) {
                     "tools\反馈报告.ps1 会自动读这个文件，不用你手填。"
                 )
                 [IO.File]::WriteAllText((Join-Path $Root "logs\速度.txt"), ($sv -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+                # 上面那份是「最近一次」的详情，每次覆盖。再往 速度历史.txt 追加一行 ——
+                # 不然「今天是不是比昨天慢 / 这支盘是不是老化了」永远没处查。
+                try {
+                    $histFile = Join-Path $Root "logs\速度历史.txt"
+                    $histLine = ("{0}  {1}  {2:N1} tok/s  首字 {3:N2}s  提示 {4:N1} tok/s  {5}  ctx {6}" -f `
+                        (Get-Date -Format 'yyyy-MM-dd HH:mm'), $model.Name, $tps, ($ttft / 1000), $pps, $backend, $Ctx)
+                    if (-not (Test-Path $histFile)) {
+                        [IO.File]::WriteAllText($histFile,
+                            "每次启动实测的速度（一行一次，只留最近 50 条；详情看 速度.txt）`r`n",
+                            (New-Object Text.UTF8Encoding($true)))
+                    }
+                    [IO.File]::AppendAllText($histFile, $histLine + "`r`n", (New-Object Text.UTF8Encoding($true)))
+                    $hl = @(Get-Content $histFile -Encoding utf8)
+                    # 第 1 行是表头，永远留着；正文超过 50 行就砍掉最旧的。
+                    if ($hl.Count -gt 51) {
+                        $keep = @($hl[0]) + @($hl[($hl.Count - 50)..($hl.Count - 1)])
+                        [IO.File]::WriteAllText($histFile, ($keep -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+                    }
+                } catch { }
             } catch { }
         }
     }

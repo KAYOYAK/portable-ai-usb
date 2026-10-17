@@ -257,7 +257,25 @@ Write-Host ""
 Head "完成"
 Show-Installed
 Write-Host ""
-Write-Host "  现在可以直接双击 启动AI.bat 试试。" -ForegroundColor Green
+# 换模型只改 models\当前模型.txt，启动器下次启动才读它。要是 AI 正开着，
+# 你回到聊天界面会发现毫无变化 —— 会被当成「这功能坏了」，所以先说清楚。
+$engines = @()
+try {
+    $modelRoot = Split-Path $dirModels -Parent
+    $engines = @(Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue | Where-Object {
+        $pth = $null
+        try { $pth = $_.Path } catch { $pth = $null }   # 别的用户的进程读不到 Path
+        $pth -and $pth.StartsWith($modelRoot, [StringComparison]::OrdinalIgnoreCase)
+    })
+} catch { }
+
+if ($engines.Count -gt 0) {
+    $pids = ($engines | ForEach-Object { $_.Id }) -join ', '
+    Write-Host "  [注意] AI 现在正开着（PID $pids），换模型不会立刻生效。" -ForegroundColor Yellow
+    Write-Host "         先关掉那个启动窗口，再双击 启动AI.bat，才会用上新模型。" -ForegroundColor Yellow
+} else {
+    Write-Host "  现在可以直接双击 启动AI.bat 试试。" -ForegroundColor Green
+}
 if ($ramGB -gt 0 -and $ramGB -lt $pick.Ram) {
     Write-Host "  （记得刚才那条内存提醒：这台机器跑它可能偏慢）" -ForegroundColor Yellow
 }

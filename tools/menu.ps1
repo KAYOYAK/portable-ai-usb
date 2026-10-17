@@ -114,7 +114,7 @@ function Show-Menu {
     Write-Host "    [18] 模型管理  (看详情 / 换模型 / 删掉不用的)"
     Write-Host "    [20] 检查有没有新版本"
     Write-Host "    [21] 清理 workspace 的旧备份  (攒多了占空间)"
-    Write-Host "    [22] 打开上次对话  (logs\上次对话.txt)"
+    Write-Host "    [22] 对话历史      (logs\对话\ 里的每一次，挑一份看)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -778,23 +778,54 @@ while ($true) {
             Pause-Safe
         }
         "22" {
-            # 上次对话。launcher 每次启动都把上一轮的问答落到 logs\上次对话.txt，
-            # 但菜单里一直没有入口 —— 用户知道有这个东西，却不知道怎么打开。
+            # 对话历史。以前只留一份「上次对话」，聊完 A 事再聊 B 事，A 就没了。
+            # 现在 launcher 每次收摊都往 logs\对话\ 落一份带时间戳的，这里列出来挑。
             Clear-Safe
             Write-Host ""
-            Write-Host "  上次对话" -ForegroundColor Yellow
+            Write-Host "  对话历史" -ForegroundColor Yellow
             Write-Host ""
-            $chatLog = Join-Path $Root 'logs\上次对话.txt'
-            if (-not (Test-Path $chatLog)) {
-                Write-Host "  还没有。等你跟 AI 聊过一轮，下次启动时就会写出来。"
+            $chatDir = Join-Path $Root 'logs\对话'
+            $items = @()
+            if (Test-Path $chatDir) {
+                $items = @(Get-ChildItem $chatDir -Filter '*.txt' -File -ErrorAction SilentlyContinue |
+                           Sort-Object LastWriteTime -Descending)
+            }
+            # 旧的「上次对话.txt」：老 U 盘上还没有 对话\ 目录时，至少别让这个入口空着。
+            if ($items.Count -eq 0) {
+                $legacy = Join-Path $Root 'logs\上次对话.txt'
+                if (Test-Path $legacy) {
+                    Write-Host "  logs\对话\ 里还没有分次存档，先给你看旧的那一份。" -ForegroundColor DarkGray
+                    Write-Host "  （下次正常关掉 AI 之后，就会按次存进 logs\对话\ 了）" -ForegroundColor DarkGray
+                    Write-Host ""
+                    $items = @(Get-Item $legacy)
+                }
+            }
+            if ($items.Count -eq 0) {
+                Write-Host "  还没有。等你跟 AI 聊过一轮并正常关掉，这里就会出现。"
                 Write-Host ""
-                Write-Host "  它在哪：$chatLog" -ForegroundColor DarkGray
+                Write-Host "  存在哪：$chatDir" -ForegroundColor DarkGray
                 Write-Host ""
                 Pause-Safe
                 continue
             }
-            $fi = Get-Item $chatLog
-            $lines = @(Get-Content $chatLog -Encoding UTF8 -ErrorAction SilentlyContinue)
+            Write-Host ("  共 {0} 次对话（只留最近 30 次）" -f $items.Count) -ForegroundColor DarkGray
+            Write-Host ""
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                $f = $items[$i]
+                $ln = @(Get-Content $f.FullName -Encoding UTF8 -ErrorAction SilentlyContinue).Count
+                Write-Host ("   [{0,2}]  {1:yyyy-MM-dd HH:mm}   {2,7:N1} KB   {3,3} 行" -f ($i + 1), $f.LastWriteTime, ($f.Length / 1KB), $ln)
+            }
+            Write-Host ""
+            $pick = Read-Choice "  打开第几个？(回车取消)"
+            $n = 0
+            if (-not [int]::TryParse($pick, [ref]$n) -or $n -lt 1 -or $n -gt $items.Count) {
+                if ($pick) { Write-Host "  没有这个编号，取消。" -ForegroundColor Yellow }
+                Pause-Safe
+                continue
+            }
+            $fi = $items[$n - 1]
+            $lines = @(Get-Content $fi.FullName -Encoding UTF8 -ErrorAction SilentlyContinue)
+            Write-Host ""
             Write-Host ("  文件 :  {0}" -f $fi.FullName)
             Write-Host ("  时间 :  {0:yyyy-MM-dd HH:mm}" -f $fi.LastWriteTime)
             Write-Host ("  大小 :  {0:N1} KB / {1} 行" -f ($fi.Length / 1KB), $lines.Count)
