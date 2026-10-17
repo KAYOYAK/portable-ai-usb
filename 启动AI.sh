@@ -49,7 +49,8 @@ ALLOW_WRITE=0           # --allow-write：再加上写文件 / 改文件
 TOOL_DIR=""             # --tool-dir：AI 能看见的目录（默认 <U盘>/workspace）
 TOOL_DIR_FROM=""
 # 采样参数：留空表示"没显式给"，按 参数设置.txt > 内置默认 的顺序定
-S_TEMP=""; S_TOP_P=""; S_TOP_K=""; S_MIN_P=""; S_REPEAT=""; S_NPRED=""
+S_TEMP=""; S_TOP_P=""; S_TOP_K=""; S_MIN_P=""; S_REPEAT=""; S_NPRED=""; S_THREADS=""
+NO_SPEED_TEST=0
 PARAM_FROM="内置默认"
 
 # ---------------------------------------------------------------- 输出
@@ -188,6 +189,8 @@ while [ $# -gt 0 ]; do
                        esac
                        TOOL_DIR="$1" ;;
         --temp)        shift; S_TEMP="${1:-}" ;;
+    --threads)      shift; S_THREADS="${1:-}" ;;
+    --no-speed-test) NO_SPEED_TEST=1 ;;
         --top-p)       shift; S_TOP_P="${1:-}" ;;
         --top-k)       shift; S_TOP_K="${1:-}" ;;
         --min-p)       shift; S_MIN_P="${1:-}" ;;
@@ -654,6 +657,7 @@ if [ -f "$PARAM_FILE" ]; then
             min_p)          [ -z "$S_MIN_P" ]  && S_MIN_P="$_v" ;;
             repeat_penalty) [ -z "$S_REPEAT" ] && S_REPEAT="$_v" ;;
             n_predict)      [ -z "$S_NPRED" ]  && S_NPRED="$_v" ;;
+            threads)        [ -z "$S_THREADS" ] && S_THREADS="$_v" ;;
         esac
     done < "$PARAM_FILE"
     PARAM_FROM="参数设置.txt"
@@ -664,6 +668,23 @@ fi
 [ -n "$S_MIN_P" ]  || S_MIN_P="0"
 [ -n "$S_REPEAT" ] || S_REPEAT="1.1"
 [ -n "$S_NPRED" ]  || S_NPRED="-1"
+
+# 线程数：命令行 > 参数设置.txt > 按核数自动（上限 8，再高一般只是发热）
+THREADS_AUTO=$(( CPU_CORES > 8 ? 8 : CPU_CORES ))
+THREADS="$THREADS_AUTO"
+THREADS_FROM="自动"
+if [ -n "$S_THREADS" ] && [ "$S_THREADS" != "0" ]; then
+    case "$S_THREADS" in
+        *[!0-9]*)
+            warn "参数设置.txt 里的 threads 不是数字：$S_THREADS —— 按自动值 $THREADS_AUTO 用" ;;
+        *)
+            if [ "$S_THREADS" -ge 1 ] && [ "$S_THREADS" -le 256 ]; then
+                THREADS="$S_THREADS"; THREADS_FROM="参数设置.txt"
+            else
+                warn "threads=$S_THREADS 超出 1~256 —— 按自动值 $THREADS_AUTO 用"
+            fi ;;
+    esac
+fi
 
 # ---- 让 AI 读文件 / 改文件 ----
 # 引擎内置工具，通过 --tools 打开；开启后引擎自己会把 CORS 限制到 localhost。
@@ -689,6 +710,47 @@ if [ "$READ_FILES" = 1 ] || [ "$ALLOW_WRITE" = 1 ]; then
     if [ -n "$SYS_PROMPT" ]; then
         SYS_PROMPT="$SYS_PROMPT文件都在当前目录，路径直接写文件名就行。这个系统是 $(uname -s)。改文件用 write_file 或 edit_file，不要用命令行改。"
     fi
+fi
+
+# ---- 上一次的对话存档 ----
+# 引擎可以把每次请求的完整 prompt 记下来（--log-prompts-dir）。客户端每轮都会把
+# 整个对话重发一遍，所以最后一个文件里就是整段对话。
+#
+# 这里在**启动时**转存上一次留下的文件，而不是退出时 —— 因为下面用的是 exec，
+# 启动器进程会被引擎顶替掉，没有"退出时"可言。启动时转存的另一个好处：
+# 直接关终端、断电、kill -9 这几种收不了摊的情况，下次启动照样能补上。
+_conv_prompt() {
+    _pd="$ROOT/logs/prompts"
+    [ -d "$_pd" ] || return 0
+    _newest="$(ls -t "$_pd"/* 2>/dev/null | head -n 1)"
+    [ -n "$_newest" ] || return 0
+    _body="$(awk '
+        {
+            gsub(/<[|]im_start[|]>[ \t]*system[ \t]*/,    "\n【系统提示】")
+            gsub(/<[|]im_start[|]>[ \t]*user[ \t]*/,      "\n【我】")
+            gsub(/<[|]im_start[|]>[ \t]*assistant[ \t]*/, "\n【AI】")
+            gsub(/<[|]im_end[|]>/, "")
+            gsub(/<[|]im_start[|]>[ \t]*[A-Za-z_]+[ \t]*/, "\n")
+            print
+        }' "$_newest" | cat -s | sed -e '/./,$!d')"
+    [ -n "$_body" ] || return 0
+    {
+        printf '上一次运行时聊的内容（从引擎的 prompt 记录还原）\n'
+        printf '记录时间：%s\n\n' "$(date '+%Y-%m-%d %H:%M')"
+        printf '两点说明：\n'
+        printf '  1. 引擎是「发送前」记的，所以最后一句 AI 回答不在里面。\n'
+        printf '  2. 这段只是给你回看的，导不回界面、不能接着聊。\n'
+        printf '========================================================\n'
+        printf '%s\n' "$_body"
+    } > "$ROOT/logs/上次对话.txt"
+    info "上次聊的内容已存到 logs/上次对话.txt（能回看，导不回界面）"
+}
+
+PROMPT_DIR="$ROOT/logs/prompts"
+mkdir -p "$PROMPT_DIR" 2>/dev/null || PROMPT_DIR=""
+if [ -n "$PROMPT_DIR" ]; then
+    _conv_prompt
+    rm -f "$PROMPT_DIR"/* 2>/dev/null || true
 fi
 
 # ---- 拼参数 ----
@@ -743,6 +805,8 @@ fi
 if [ "$TOOLS_ON" = 1 ]; then
     set -- "$@" --tools "$TOOLS_LIST"
 fi
+
+[ -n "$PROMPT_DIR" ] && set -- "$@" --log-prompts-dir "$PROMPT_DIR"
 
 # 引擎没设钥匙时会自己打一行 "no API key is set and CORS allows all origins"。
 # 只在本机跑无所谓；一旦开了局域网，同一个 wifi 下谁都能用。
@@ -939,7 +1003,7 @@ info "就绪之后：$URL"
 info "停掉：这个窗口按 Ctrl-C，或另开窗口跑 bash 启动AI.sh --stop"
 printf '\n'
 
-if [ "$OPEN_BROWSER" = 1 ]; then
+if [ "$OPEN_BROWSER" = 1 ] || [ "$NO_SPEED_TEST" = 0 ]; then
     (
         # 这个看守是"孤儿候选"：下面的 exec 会把启动器进程整个换成引擎，
         # shell 级的 EXIT trap 随之消失，没有人管得到这个子 shell。
@@ -955,10 +1019,33 @@ if [ "$OPEN_BROWSER" = 1 ]; then
             # -f 让 4xx/5xx 也算失败：模型还在加载时 /health 返回 503，
             # 不带 -f 的话那一刻就当成"就绪"，浏览器会开在一个还没准备好的服务上。
             if curl -fsS -o /dev/null --max-time 2 "$URL/health" 2>/dev/null; then
-                case "$PLATFORM_OS" in
-                    macos) open "$URL" >/dev/null 2>&1 ;;
-                    linux) command -v xdg-open >/dev/null 2>&1 && xdg-open "$URL" >/dev/null 2>&1 ;;
-                esac
+                # 实测速度：拿一次真请求的 timings。启动器不测，用户就只能靠感觉猜。
+                if [ "$NO_SPEED_TEST" = 0 ]; then
+                    _sj="$(curl -s --max-time 120 -H 'Content-Type: application/json' \
+                        -d '{"messages":[{"role":"user","content":"用一句话介绍一下你自己。"}],"max_tokens":40,"temperature":0}' \
+                        "$URL/v1/chat/completions" 2>/dev/null)"
+                    _pps="$(printf '%s' "$_sj" | sed -n 's/.*"predicted_per_second"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p')"
+                    _pq="$(printf '%s' "$_sj" | sed -n 's/.*"prompt_per_second"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p')"
+                    if [ -n "$_pps" ]; then
+                        printf '   实测速度: %s token/秒   （提示处理 %s；单位是 token，中文约 1 字 = 0.6~1 token）\n' "$_pps" "${_pq:-?}"
+                        {
+                            printf '本机实测速度（启动器自动生成，%s）\n\n' "$(date '+%Y-%m-%d %H:%M')"
+                            printf '生成速度 : %s token/秒\n' "$_pps"
+                            printf '提示处理 : %s token/秒\n' "${_pq:-未测到}"
+                            printf '后端     : %s\n' "$BACKEND_FULL"
+                            printf '上下文   : %s tokens，KV %s\n' "$CTX" "${KV_SHOWN:-默认}"
+                            printf '线程     : %s\n\n' "$THREADS"
+                            printf '单位说明：1 token 约等于 0.6~1 个汉字，或约 0.75 个英文单词。\n'
+                            printf 'tools/反馈报告.ps1 会自动读这个文件，不用你手填。\n'
+                        } > "$ROOT/logs/速度.txt" 2>/dev/null || true
+                    fi
+                fi
+                if [ "$OPEN_BROWSER" = 1 ]; then
+                    case "$PLATFORM_OS" in
+                        macos) open "$URL" >/dev/null 2>&1 ;;
+                        linux) command -v xdg-open >/dev/null 2>&1 && xdg-open "$URL" >/dev/null 2>&1 ;;
+                    esac
+                fi
                 break
             fi
         done

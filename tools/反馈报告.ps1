@@ -140,12 +140,29 @@ $gpuAll  = ($gpus | ForEach-Object { $_.Name }) -join '  |  '
 $drvRaw  = if ($gpus.Count -gt 0) { $gpus[0].Driver } else { "" }
 $drvPub  = Convert-Driver $drvRaw
 
+# 启动器启动成功时会把实测速度写进 logs\速度.txt。有就直接用 —— 让用户去数
+# "每秒几个字"本来就是我们自己能量的东西。没有这个文件（比如引擎根本没起来）
+# 才退回让用户手填。
+$speedFile = Join-Path $Root "logs\速度.txt"
+$speedLine = $null
+if (Test-Path $speedFile) {
+    try {
+        foreach ($sl in [IO.File]::ReadAllLines($speedFile)) {
+            if ($sl -match '^\s*生成速度\s*:\s*(.+)$') { $speedLine = $Matches[1].Trim() }
+        }
+    } catch { }
+}
+
 $out = New-Object System.Collections.Generic.List[string]
 $out.Add("===== U盘 AI 便携版 · 硬件反馈报告 =====")
 $out.Add("")
 $out.Add("【请先填这两行，其余都已自动生成】")
 $out.Add("结果        : (能跑 / 起不来 / 能起但很慢)     <- 改这里")
-$out.Add("生成速度    : (大概每秒几个字，或「没见到出字」)   <- 改这里")
+if ($speedLine) {
+    $out.Add("生成速度    : $speedLine   (启动器自动实测，不用改)")
+} else {
+    $out.Add("生成速度    : (大概每秒几个字，或「没见到出字」)   <- 改这里")
+}
 $out.Add("")
 $out.Add("----- 硬件 -----")
 $out.Add((Line "CPU"        $(if ($cores) { "$cpu  ($cores 核)" } else { $cpu })))
@@ -159,6 +176,11 @@ $out.Add("----- 引擎看到的设备 -----")
 if ($deviceLines.Count -gt 0) { foreach ($l in $deviceLines) { $out.Add($l) } }
 else { $out.Add("  (没跑出结果 —— 可能 models\llama.cpp 缺失，或 exe 起不来)") }
 $out.Add("")
+if ($speedLine) {
+    $out.Add("----- 速度（启动器实测）-----")
+    try { foreach ($sl in [IO.File]::ReadAllLines($speedFile)) { $out.Add("  " + $sl) } } catch { }
+    $out.Add("")
+}
 $out.Add("----- 启动器探测 -----")
 if ($probeText) { foreach ($l in ($probeText -split "`r?`n")) { $out.Add("  " + $l) } }
 else { $out.Add("  (没跑出结果)") }

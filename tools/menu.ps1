@@ -423,6 +423,7 @@ while ($true) {
                         Write-Host "   min_p             0 ~ 1         0           冷水词过滤"
                         Write-Host "   repeat_penalty   0.5 ~ 2       1.1         1.0 = 关掉；老重复就调高"
                         Write-Host "   n_predict         -1 ~ 32768    -1          -1 = 不限；限死能防它啰嗦"
+                        Write-Host "   threads           0 ~ 256       0           0 = 按 CPU 核数自动；纯 CPU 跑时最关键"
                         Write-Host "  ------------------------------------------------------------"
                         Write-Host ""
                         Write-Host "  一次改一个键：先输键名，再输值。留空 = 不改。"
@@ -433,6 +434,7 @@ while ($true) {
                         $known = @{
                             temp = @(0.0, 2.0); top_p = @(0.0, 1.0); top_k = @(0, 200)
                             min_p = @(0.0, 1.0); repeat_penalty = @(0.5, 2.0); n_predict = @(-1, 32768)
+                            threads = @(0, 256)
                         }
                         if (-not $known.ContainsKey($key)) {
                             Write-Host ""
@@ -469,15 +471,18 @@ while ($true) {
                                 if ($m.Success) { $map[$m.Groups[1].Value.ToLower()] = $m.Groups[2].Value.Trim() }
                             }
                         }
+                        # threads 是整数，别写成 "16.0" —— 用户看了会以为哪里不对
+                        if ($key -eq 'threads') { $val = [string][int]$num }
                         $map[$key] = $val.Trim()
                         $out = @(
                             '# U盘 AI 便携版 —— 采样参数',
                             '# 改完重启生效。删掉某个键 = 该键回到内置默认。',
                             '# 范围：temp 0~2 / top_p 0~1 / top_k 0~200 / min_p 0~1 /',
-                            '#       repeat_penalty 0.5~2（1.0=关） / n_predict -1~32768（-1=不限）',
+                            '#       repeat_penalty 0.5~2（1.0=关） / n_predict -1~32768（-1=不限） /',
+                            '#       threads 0~256（0=按核数自动）',
                             ''
                         )
-                        foreach ($k in @('temp','top_p','top_k','min_p','repeat_penalty','n_predict')) {
+                        foreach ($k in @('temp','top_p','top_k','min_p','repeat_penalty','n_predict','threads')) {
                             if ($map.Contains($k)) { $out += "$k = $($map[$k])" }
                         }
                         try {
@@ -498,7 +503,7 @@ while ($true) {
                         if (Test-Path $paFile) {
                             Remove-Item $paFile -Force -ErrorAction SilentlyContinue
                             Write-Host "  已删掉 参数设置.txt，所有采样参数改回内置默认：" -ForegroundColor Green
-                            Write-Host "    temp 0.6 / top_p 0.95 / top_k 20 / min_p 0 / repeat_penalty 1.1 / n_predict 不限"
+                            Write-Host "    temp 0.6 / top_p 0.95 / top_k 20 / min_p 0 / repeat_penalty 1.1 / n_predict 不限 / threads 自动"
                         } else {
                             Write-Host "  本来就没改过参数，现在用的就是内置默认值。"
                         }

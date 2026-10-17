@@ -1,5 +1,6 @@
 ﻿<#
-================================================================
+========================================
+========================
   portable-ai-usb  ·  启动器
 ================================================================
   模型 : MiMo-V2.6-Distill-Qwen-9B (GGUF)
@@ -54,6 +55,8 @@ param(
     [double]$MinP = 0,             # 0~1
     [double]$RepeatPenalty = 0,    # 0.5~2  1.0 = 关掉
     [int]$NPredict = 0,            # -1 = 不限；1~32768 = 每条回答最多这么多 token
+    [int]$Threads = 0,             # 线程数。0 = 自动（按 CPU 核数）。纯 CPU 兜底时这个最关键
+    [switch]$NoSpeedTest,          # 跳过启动后的速度自测（会多花一两秒）
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
@@ -135,6 +138,17 @@ function Test-UnderRoot([string]$path) {
 #     这里按可执行文件路径过滤，只动 U 盘目录里的那几个。
 if ($Stop) {
     Head "停止本 U 盘的 AI 引擎"
+
+    # 留个标记，好让"正在运行的那个启动器"知道你这一下是主动停的、不是崩了。
+    # 没有它，菜单里按 [7] 停掉引擎后，原来那个窗口会打一整屏红字说"引擎异常退出"。
+    # 三分钟内的标记才算数 —— 过期标记不能拿来掩盖后来的真崩溃。
+    try {
+        $mk = Join-Path $Root "logs"
+        if (-not (Test-Path $mk)) { New-Item -ItemType Directory -Force -Path $mk | Out-Null }
+        [IO.File]::WriteAllText((Join-Path $mk ".manual-stop"), (Get-Date).ToString('o'),
+            (New-Object Text.UTF8Encoding($false)))
+    } catch { }
+
     $killed = 0; $skipped = 0
     $procs = @(Get-Process -Name "llama-server" -ErrorAction SilentlyContinue)
     if ($procs.Count -eq 0) {
@@ -862,6 +876,7 @@ $ParamDefaults = [ordered]@{
     min_p          = 0.0
     repeat_penalty = 1.1
     n_predict      = -1
+    threads        = 0
 }
 $ParamRanges = @{
     temp           = @(0.0, 2.0)
@@ -870,6 +885,7 @@ $ParamRanges = @{
     min_p          = @(0.0, 1.0)
     repeat_penalty = @(0.5, 2.0)
     n_predict      = @(-1, 32768)
+    threads        = @(0, 256)
 }
 $ParamFile = Join-Path $Root "参数设置.txt"
 $sample = [ordered]@{}
@@ -881,6 +897,7 @@ $sampleNote = @()
 $cliMap = [ordered]@{
     temp = 'Temp'; top_p = 'TopP'; top_k = 'TopK'
     min_p = 'MinP'; repeat_penalty = 'RepeatPenalty'; n_predict = 'NPredict'
+    threads = 'Threads'
 }
 foreach ($k in $cliMap.Keys) {
     if ($PSBoundParameters.ContainsKey($cliMap[$k])) {
@@ -934,6 +951,10 @@ if (Test-Path $ParamFile) {
 # 传给引擎的数字必须用不变文化格式。中文区域的小数点也是 "."，但别的区域未必，
 # 拼成 "0,6" 引擎会当成两个参数 —— 这种错只在某些机器上出现，最难查。
 function Inv([double]$v) { return $v.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+
+# 线程数。0 = 自动，用上面按核数算出来的那个。纯 CPU 兜底时这是唯一还能救一下的旋钮 ——
+# OOM 降档到 CPU 之后速度几乎完全由它决定，而以前它被写死在核数上，用户改不了。
+$threads = if ([int]$sample.threads -gt 0) { [int]$sample.threads } else { [math]::Max(2, $cores) }
 
 # ---------------- 6.4 让 AI 读文件 ----------------
 # 引擎自己的内置工具。开了以后：客户端带 tools 数组发请求 → 模型回一个 tool_call →
@@ -1075,6 +1096,75 @@ function Show-WorkspaceDiff {
     }
     Write-Host ""
 }
+# ---------------- 6.05 对话存档 ----------------
+# 引擎的聊天界面把对话放在浏览器内存里，localStorage 只存配置（翻过 8.8MB 的
+# bundle.js 确认过：没有 chatHistory、没有导出按钮、没有 slot 保存/恢复的 UI）。
+# 所以关掉窗口 = 整段对话蒸发。
+#
+# 能拿到的是引擎自己记录的「每次请求的完整 prompt」。客户端每轮都会把整个对话
+# 重发一遍，所以最后一个 prompt 文件里就是整段对话。收摊时把它转成人能读的样子，
+# 落到 logs\上次对话.txt。
+#
+# 已知缺口：引擎是在发送前记的，所以**最后一句 AI 回答不在里面**。够用来找回
+# "我刚才说到哪了"，不够用来原样恢复对话。
+function Save-LastChat {
+    if (-not $promptDir) { return }
+    try {
+        if (-not (Test-Path $promptDir)) { return }
+        $newest = Get-ChildItem $promptDir -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $newest) { return }
+        $t = [IO.File]::ReadAllText($newest.FullName)
+        if (-not $t) { return }
+        # 开了工具之后，prompt 里会多出一整段英文 JSON 描述工具签名（近 2 KB）。
+        # 存档是给人看的，那段纯属噪音 —— 只留「有哪些工具」，其余丢掉。
+        $t = [regex]::Replace($t,
+            '(?s)<\|im_start\|>\s*system\s*You are provided with the following tools:.*?<\|im_end\|>',
+            {
+                param($m)
+                $names = @([regex]::Matches($m.Value, '"function"\s*:\s*\{\s*"name"\s*:\s*"([A-Za-z0-9_]+)"') |
+                           ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+                if ($names.Count) { "`r`n【可用工具】`r`n" + ($names -join '  /  ') + "`r`n" } else { "" }
+            })
+        $t = $t -replace '<\|im_start\|>\s*system\s*', "`r`n【系统提示】`r`n"
+        $t = $t -replace '<\|im_start\|>\s*user\s*', "`r`n【我】`r`n"
+        $t = $t -replace '<\|im_start\|>\s*assistant\s*', "`r`n【AI】`r`n"
+        $t = $t -replace '<\|im_end\|>', ''
+        $t = $t -replace '<\|im_start\|>\s*[A-Za-z_]+\s*', "`r`n"
+        $t = $t.Trim()
+        if (-not $t) { return }
+        $out = Join-Path $Root "logs\上次对话.txt"
+        $head = (@(
+            "上一次运行时聊的内容（从引擎的 prompt 记录还原）"
+            "记录时间：$($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
+            ""
+            "两点说明："
+            "  1. 引擎是「发送前」记的，所以最后一句 AI 回答不在里面。"
+            "  2. 这段只是给你回看的，导不回界面、不能接着聊。"
+            ("=" * 56)
+            ""
+        )) -join "`r`n"
+        [IO.File]::WriteAllText($out, $head + $t + "`r`n", (New-Object Text.UTF8Encoding($true)))
+        Write-Host "  上次对话已存到 logs\上次对话.txt（能回看，导不回界面）" -ForegroundColor DarkGray
+    } catch { }
+}
+
+# 收摊时存档，只覆盖得了"正常停止"。直接关窗口、拔电源、或者从没关过窗口就
+# 再启动一次 —— 那几种情况收摊代码根本跑不到。所以在清空 prompts 之前再存一次：
+# 用的是上一次运行留下的文件。这样四种情况都能回看。
+$promptDir = Join-Path $Root "logs\prompts"
+try { Save-LastChat } catch { }
+
+try {
+    if (Test-Path $promptDir) {
+        Get-ChildItem $promptDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    } else {
+        New-Item -ItemType Directory -Path $promptDir -Force | Out-Null
+    }
+} catch {
+    $promptDir = $null    # 建不出来就不记，别拦住启动
+}
+
 # ---------------- 6. 拼参数 ----------------
 # 参数要拼两次：第一次按原配置，降档重试时按新配置。只留这一份拼装逻辑 ——
 # 之前降档那段是手抄一遍的，后来加的开关（多模态、默认系统提示、局域网钥匙）
@@ -1097,6 +1187,9 @@ function Build-Args {
         "--repeat-penalty", (Inv $sample.repeat_penalty),
         "--n-predict", "$([int]$sample.n_predict)"
     )
+    if ($promptDir) {
+        $a += @("--log-prompts-dir", $promptDir)
+    }
     # 纯 CPU 跑时没有 CUDA/Vulkan 后端，--flash-attn 和 KV 量化都是显卡侧的东西。
     if ($backend -ne "cpu") {
         $a += @("--flash-attn", "on", "--cache-type-k", $kvType, "--cache-type-v", $kvType)
@@ -1626,6 +1719,45 @@ if ($ready) {
         Write-Host "   手机/平板同一个 wifi 打开： http://${lanIP}:$Port" -ForegroundColor Green
     }
     Write-Host ("=" * 64) -ForegroundColor Green
+    # 引擎每次回答都会返回 timings，直接就有每秒 token 数 —— 不用开 --metrics。
+    # 之前 tools\反馈报告.ps1 让用户手填"生成速度"，那是把我们自己能量的东西外包给用户。
+    # 顺带把模型预热了：第一条真问题会比冷启动时快。
+    if (-not $NoSpeedTest) {
+        $tps = 0
+        $pps = 0
+        try {
+            $sb = @{
+                messages    = @(@{ role = 'user'; content = '从1数到10，只写数字，用逗号隔开。' })
+                max_tokens  = 40
+                temperature = 0
+            } | ConvertTo-Json -Depth 6 -Compress
+            $sr = Invoke-RestMethod "http://127.0.0.1:$Port/v1/chat/completions" -Method Post `
+                -ContentType 'application/json; charset=utf-8' `
+                -Body ([Text.Encoding]::UTF8.GetBytes($sb)) -TimeoutSec 180
+            if ($sr.timings) {
+                if ($sr.timings.predicted_per_second) { $tps = [double]$sr.timings.predicted_per_second }
+                if ($sr.timings.prompt_per_second)    { $pps = [double]$sr.timings.prompt_per_second }
+            }
+        } catch { }
+        if ($tps -gt 0) {
+            Write-Host ("   实测速度: {0:N1} token/秒   （提示处理 {1:N1}；单位是 token，中文约 1 字 = 0.6~1 token）" -f $tps, $pps) -ForegroundColor Green
+            try {
+                $sv = @(
+                    "本机实测速度（启动器自动生成，$(Get-Date -Format 'yyyy-MM-dd HH:mm')）"
+                    ""
+                    ("生成速度 : {0:N1} token/秒" -f $tps)
+                    ("提示处理 : {0:N1} token/秒" -f $pps)
+                    ("后端     : $backendName")
+                    ("上下文   : $Ctx tokens，KV $kvType")
+                    ("线程     : $threads")
+                    ""
+                    "单位说明：1 token 约等于 0.6~1 个汉字，或约 0.75 个英文单词。"
+                    "tools\反馈报告.ps1 会自动读这个文件，不用你手填。"
+                )
+                [IO.File]::WriteAllText((Join-Path $Root "logs\速度.txt"), ($sv -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+            } catch { }
+        }
+    }
     if (-not $NoBrowser) { Start-Process $url }
     # 有新版才吭声，没网/已最新都安静 —— 启动路径上不该多出两行噪音。
     try { Test-Update -Quiet | Out-Null } catch { }
@@ -1642,6 +1774,97 @@ if ($ready) {
 
 Write-Host ""
 Write-Host "  保持本窗口开启 = AI 持续运行。关闭窗口或 Ctrl+C 即停止。" -ForegroundColor DarkGray
-try { Wait-Process -Id $proc.Id } catch { }
-Write-Host "  引擎已停止。"
+
+# ---------------- 7. 就绪之后的看护 ----------------
+# 以前这里是 Wait-Process：引擎活得怎么样，一律不知道。不管是按 Ctrl+C 正常停，
+# 还是显存炸了崩的，打出来都是同一句"引擎已停止"。而浏览器那头页面还开着，
+# 只是每次发消息都失败 —— 用户看到的是"AI 不理我了"，分不出是崩了还是他关了。
+#
+# 这里改成每 3 秒看一眼：进程还在不在、日志里有没有新的上下文水位。
+# 能在循环里走到 HasExited，就说明不是用户关窗口（关窗口时 PowerShell 自己先死，
+# 根本执行不到下面）。所以这就是异常退出的可靠信号。
+if ($proc -and -not $proc.HasExited) {
+    $logOffset = 0
+    try { if (Test-Path $log) { $logOffset = (Get-Item $log).Length } } catch { }
+    $ctxWarned = $false
+    $truncWarned = $false
+    while ($true) {
+        Start-Sleep -Seconds 3
+        if ($proc.HasExited) { break }
+        try {
+            if (-not (Test-Path $log)) { continue }
+            $len = (Get-Item $log).Length
+            if ($len -le $logOffset) { continue }
+            $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite')
+            try {
+                [void]$fs.Seek($logOffset, 'Begin')
+                $buf = New-Object byte[] ($len - $logOffset)
+                [void]$fs.Read($buf, 0, $buf.Length)
+                $chunk = [Text.Encoding]::UTF8.GetString($buf)
+            } finally { $fs.Close() }
+            $logOffset = $len
+            # 上下文满有两种表现，实测过：
+            #   a) 水位超 80%  —— 日志里 stop processing 的 n_tokens 涨上来，还有救
+            #   b) 真的塞不下  —— 引擎直接 400，日志里是
+            #      "request (4550 tokens) exceeds the available context size (4096 tokens)"
+            #      （实测：单条消息超长、或历史累积超长，都会走这条，不会出现 truncated=1）
+            # 两种都得说人话，否则用户看到的只是"AI 突然不理我了"。
+            foreach ($mm in [regex]::Matches($chunk, 'request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)')) {
+                if (-not $truncWarned) {
+                    $truncWarned = $true
+                    Write-Host ""
+                    Write-Host ("  [上下文满了] 这一条塞不进去：引擎要 {0} tokens，上限只有 {1}。" -f $mm.Groups[1].Value, $mm.Groups[2].Value) -ForegroundColor Yellow
+                    Write-Host "  这次回答没生成出来。开个新对话，或者把问题说短一点、长文件拆开问。" -ForegroundColor Yellow
+                    Write-Host "  想让它一次能装更多：重启时用 高级选项.bat 的 [2]（64K 上下文），但要显存够。" -ForegroundColor Yellow
+                }
+            }
+            foreach ($mm in [regex]::Matches($chunk, 'stop processing:\s*n_tokens\s*=\s*(\d+),\s*truncated\s*=\s*\d+')) {
+                $used = [int]$mm.Groups[1].Value
+                if (-not $ctxWarned -and $Ctx -gt 0 -and $used -ge [int]($Ctx * 0.8)) {
+                    $ctxWarned = $true
+                    Write-Host ""
+                    Write-Host ("  [快满了] 这段对话已用 {0} / {1} tokens（约 {2}%）。" -f $used, $Ctx, [math]::Round($used * 100 / $Ctx)) -ForegroundColor Yellow
+                    Write-Host "  再说下去最早的对话会被丢掉，建议开个新对话。" -ForegroundColor Yellow
+                }
+            }
+        } catch { }
+    }
+}
+
+# 走到这里，说明引擎退了而启动器还活着。只有两种可能：
+#   1. 用户在菜单里按了 [7] 停止  —— 那是你要它停的
+#   2. 引擎自己崩了（显存被抢、拔电源、模型损坏）
+# 用户直接关窗口时 PowerShell 自己先死，根本执行不到这里，所以不存在"第三种"。
+#
+# 退出码拿不到：Start-Process -PassThru 拿到的对象没保留进程句柄，$proc.ExitCode
+# 会抛异常（实测恒为 null）。之前写法是 if ($code -ne $null -and $code -ne 0)，
+# 结果真正的崩溃一次也没报出来过 —— 全靠日志尾部。现在改看 -Stop 留下的标记。
+$manual  = $false
+$stopMark = Join-Path $Root "logs\.manual-stop"
+if (Test-Path $stopMark) {
+    try {
+        $age = ((Get-Date) - (Get-Item $stopMark).LastWriteTime).TotalSeconds
+        $manual = ($age -ge 0 -and $age -lt 180)
+        Remove-Item $stopMark -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+Write-Host ""
+if (-not $manual) {
+    Write-Host ("=" * 64) -ForegroundColor Red
+    Write-Host "  引擎是异常退出的，不是你自己停的。" -ForegroundColor Red
+    Write-Host "  浏览器那个页面现在连不上了 —— 刷新没用，得重新启动。" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  日志最后几行：" -ForegroundColor DarkGray
+    try { Get-Content $log -Tail 12 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } } catch { }
+    Write-Host ""
+    Write-Host "  常见原因：" -ForegroundColor Yellow
+    Write-Host "    - 显存被别的程序抢了（关掉浏览器、游戏、别的 AI 再启动）" -ForegroundColor Yellow
+    Write-Host "    - 笔记本拔了电源，显卡被切到集显或降频" -ForegroundColor Yellow
+    Write-Host "    - 模型文件没复制完整（跑 tools\自检.ps1 核对）" -ForegroundColor Yellow
+    Write-Host "  要反馈的话，跑一遍 tools\反馈报告.ps1，把生成的文本发出去。" -ForegroundColor Yellow
+    Write-Host ("=" * 64) -ForegroundColor Red
+} else {
+    Write-Host "  引擎已停止（你从菜单里停的）。"
+}
+Save-LastChat
 Show-WorkspaceDiff
