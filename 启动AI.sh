@@ -42,7 +42,7 @@ CUSTOM_PROMPT=""        # --system-prompt 传进来的自定义句子
 PORT_SET=0              # 命令行有没有显式给 --port；给了就不读 端口设置.txt
 LAN=0                   # --lan：让同一个 wifi 里的手机也能连
 API_KEY=""              # --api-key：局域网模式下给接口上把锁
-APP_VERSION="1.5.0"     # 只给 --check-update 比对用
+APP_VERSION="1.7.0"     # 只给 --check-update 比对用
 DO_CHECK_UPDATE=0
 READ_FILES=0            # --read-files：让模型能看目录里的文件（只读四件）
 ALLOW_WRITE=0           # --allow-write：再加上写文件 / 改文件
@@ -1052,10 +1052,10 @@ if [ "$OPEN_BROWSER" = 1 ] || [ "$NO_SPEED_TEST" = 0 ]; then
     ) &
 fi
 
-trap 'kill $(jobs -p) 2>/dev/null || true' EXIT INT TERM
+trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 
 # exFAT / FAT32 上没有可执行位，从 Windows 拷进去的引擎挂到 Linux 后常常没有 x。
-# 先自己补一次；补不了就说清原因，别让 exec 抛一句干巴巴的 Permission denied。
+# 先自己补一次；补不了就说清原因，别让引擎抛一句干巴巴的 Permission denied。
 if [ ! -x "$ENGINE" ]; then
     chmod +x "$ENGINE" 2>/dev/null || true
 fi
@@ -1071,4 +1071,78 @@ if [ "$TOOLS_ON" = 1 ] && [ -d "$TOOL_DIR" ]; then
     cd "$TOOL_DIR" || true
 fi
 
-exec "$ENGINE" "$@"
+# ---- 起引擎，然后看着它 ----
+# 这里以前是 exec：整条脚本被引擎顶掉，于是引擎怎么没的没人说得清 ——
+# 用户自己停的和它崩掉的，屏幕上都是同一句「进程没了」。Windows 那份早就改了，
+# 这里补齐。llama.cpp 的日志全走 stderr，stdout 基本是空的，所以要重定向的是 2。
+LOG="$DIR_LOG/server-$(date '+%Y%m%d-%H%M%S').log"
+: > "$LOG" 2>/dev/null || LOG=""
+ENG_PID=""
+
+_engine_stop() {
+    printf '\n'
+    if [ -n "$ENG_PID" ] && kill -0 "$ENG_PID" 2>/dev/null; then
+        kill -TERM "$ENG_PID" 2>/dev/null || true
+        _n=0
+        while [ "$_n" -lt 10 ] && kill -0 "$ENG_PID" 2>/dev/null; do
+            sleep 0.3 2>/dev/null || sleep 1
+            _n=$((_n + 1))
+        done
+        kill -KILL "$ENG_PID" 2>/dev/null || true
+    fi
+    printf '  引擎已停止（你让它停的）。\n'
+    exit 0
+}
+
+# 从日志里捞「现在到哪一步了」。只在阶段变化时说一句 —— 把 raw 日志全倒出来
+# 会盖掉启动信息，而这里要的只是「它在动，没死」。
+_engine_phase() {
+    [ -n "$LOG" ] || return 1
+    _l="$(grep -E 'listening on|model loaded|threadpool|loading model|load_tensors' "$LOG" 2>/dev/null | tail -n 1)"
+    case "$_l" in
+        *listening\ on*)  printf '引擎已开始监听，正在等它开口…' ;;
+        *model\ loaded*)  printf '模型已就绪，正在起 HTTP 服务…' ;;
+        *threadpool*)     printf '文件读完，正在分配计算缓冲…' ;;
+        *loading\ model*) printf '正在读模型文件…' ;;
+        *load_tensors*)   printf '正在把权重装进显存…' ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+if [ -n "$LOG" ]; then
+    "$ENGINE" "$@" 2> "$LOG" &
+else
+    "$ENGINE" "$@" &
+fi
+ENG_PID=$!
+trap '_engine_stop' INT TERM HUP
+
+if [ -n "$LOG" ]; then
+    (
+        _last=""
+        while kill -0 "$ENG_PID" 2>/dev/null; do
+            if _cur="$(_engine_phase)"; then
+                [ "$_cur" = "$_last" ] || { printf '  %s\n' "$_cur"; _last="$_cur"; }
+            fi
+            sleep 2
+        done
+    ) &
+fi
+
+wait "$ENG_PID"
+RC=$?
+ENG_PID=""
+printf '\n'
+if [ "$RC" -ne 0 ]; then
+    printf '  [引擎崩了]  退出码 %s —— 这不是你停的，是它自己退出来的。\n' "$RC"
+    if [ -n "$LOG" ]; then
+        printf '  最后几行日志（完整日志：logs/%s）：\n' "$(basename "$LOG")"
+        tail -n 12 "$LOG" 2>/dev/null | sed 's/^/    /'
+    fi
+    printf '  常见原因：显存/内存不够、模型文件损坏、显卡驱动版本不匹配。\n'
+    printf '  想确诊：在 Windows 上双击「高级选项.bat」→ [17] 生成硬件反馈报告。\n'
+    exit 1
+else
+    printf '  引擎已停止。\n'
+fi

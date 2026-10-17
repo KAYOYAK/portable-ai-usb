@@ -94,6 +94,7 @@ function Show-Menu {
     Write-Host "    [17] 生成硬件反馈报告  (跑不动时发给作者)"
     Write-Host "    [18] 模型管理  (看详情 / 换模型 / 删掉不用的)"
     Write-Host "    [20] 检查有没有新版本"
+    Write-Host "    [21] 清理 workspace 的旧备份  (攒多了占空间)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -249,8 +250,7 @@ while ($true) {
         }
         "15" {
             # 让 AI 能自己读文件。默认只读 —— 把要问的文件丢进 workspace\ 再问。
-            # 写文件 / 执行命令那两档只有命令行 -AllowWrite 能开：那是把这台电脑
-            # 交出去，不该是菜单里按一个数字就能做的事。
+            # 写文件在 [19]（要手打 YES）；执行命令那一档没有入口，见 [19] 的说明。
             Clear-Safe
             Write-Host ""
             Write-Host "  让 AI 读文件（只读）：" -ForegroundColor Yellow
@@ -661,18 +661,20 @@ while ($true) {
             }
         }
         "19" {
-            # 让 AI 改文件。默认关闭 —— 这一档模型能写、能改、能执行命令，
-            # 等于把这台电脑交出去。菜单里给，但每次都要先看清这几行。
+            # 让 AI 改文件。默认关闭 —— 这一档模型能写、能改，等于把这台电脑上的
+            # 文件交给它。菜单里给，但每次都要先看清这几行。
             Clear-Safe
             Write-Host ""
             Write-Host "  让 AI 改文件（可写）：" -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "  这一档会多开三个能力：" -ForegroundColor Yellow
-            Write-Host "    写新文件 / 修改已有文件 / 执行命令"
+            Write-Host "  这一档会多开两个能力："
+            Write-Host "    写新文件 / 修改已有文件"
             Write-Host ""
+            Write-Host "  [没有执行命令] 引擎的 shell 工具在 Windows 上落到 cmd，中文会被写成问号。" -ForegroundColor DarkGray
+            Write-Host "                 早先开过一次，实测把文件写坏，所以这一档里关掉了。" -ForegroundColor DarkGray
             Write-Host "  [边界] 只能动 workspace 里的东西。" -ForegroundColor DarkGray
             Write-Host "  [备份] 每次启动前会把 workspace 原样备份一份，改完列出哪些被改。" -ForegroundColor DarkGray
-            Write-Host "  [注意] 能执行命令 = 它能在你电脑上跑程序。别让它读你不信的文件后乱操作。" -ForegroundColor Yellow
+            Write-Host "  [注意] 它按你的话直接改，不会逐条问你。只放你让它动的文件。" -ForegroundColor Yellow
             Write-Host ""
             $ok = Read-Choice "  想清楚再继续。输入 YES 开启，直接回车取消"
             if ($ok -ne 'YES') {
@@ -688,6 +690,71 @@ while ($true) {
             # 检查更新：不是自动更新，只告诉用户"有新的了，去哪下"。
             Clear-Safe
             & $Launcher -CheckUpdate
+            Pause-Safe
+        }
+        "21" {
+            # 清理旧备份。.backup\ 是 [19] 每次启动自动复制的，从不清 ——
+            # 用得久了会悄悄把 U 盘吃满，而用户没有任何线索。
+            Clear-Safe
+            Write-Host ""
+            Write-Host "  清理 workspace 的旧备份" -ForegroundColor Yellow
+            Write-Host ""
+            $bkRoot = Join-Path $Root 'workspace\.backup'
+            if (-not (Test-Path $bkRoot)) {
+                Write-Host "  没有备份目录 —— 你还没用过 [19]，或者清理过了。"
+                Write-Host ""
+                Pause-Safe
+                continue
+            }
+            $sets = @(Get-ChildItem $bkRoot -Directory -Force -ErrorAction SilentlyContinue |
+                      Sort-Object Name -Descending)
+            if ($sets.Count -eq 0) {
+                Write-Host "  备份目录是空的。"
+                Write-Host ""
+                Pause-Safe
+                continue
+            }
+            $rows = @()
+            $total = 0
+            for ($i = 0; $i -lt $sets.Count; $i++) {
+                $fs = @(Get-ChildItem $sets[$i].FullName -Recurse -File -Force -ErrorAction SilentlyContinue)
+                $kb = [math]::Round((($fs | Measure-Object Length -Sum).Sum) / 1KB, 1)
+                $total += $kb
+                $rows += [pscustomobject]@{ No = $i + 1; 时间 = $sets[$i].Name; 文件 = $fs.Count; KB = $kb }
+            }
+            $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+            Write-Host ("  合计 {0} 次、{1:N1} MB" -f $sets.Count, ($total / 1024))
+            Write-Host ""
+            Write-Host "  [1] 只留最近一次，其余删掉（能省 $(('{0:N1}' -f (($total - $rows[0].KB) / 1024))) MB）" -ForegroundColor Yellow
+            Write-Host "  [2] 按编号删某一次"
+            Write-Host "  [3] 全删（workspace 里现有的文件不受影响）"
+            Write-Host "  [回车] 什么都不做"
+            Write-Host ""
+            $sel = Read-Choice "  选一个"
+            $kill = @()
+            if ($sel -eq '1') {
+                if ($sets.Count -le 1) { Write-Host "  只有一次备份，没什么可删的。" }
+                else { $kill = @($sets | Select-Object -Skip 1) }
+            } elseif ($sel -eq '2') {
+                $n = Read-Choice "  删第几个（输编号）"
+                $idx = 0
+                if ([int]::TryParse($n, [ref]$idx) -and $idx -ge 1 -and $idx -le $sets.Count) {
+                    $kill = @($sets[$idx - 1])
+                } else { Write-Host "  [错误] 没有这个编号" -ForegroundColor Red }
+            } elseif ($sel -eq '3') {
+                $yn = Read-Choice "  全部删掉？输入 YES 确认"
+                if ($yn -eq 'YES') { $kill = @($sets) } else { Write-Host "  已取消。" }
+            }
+            if ($kill.Count -gt 0) {
+                $okN = 0
+                foreach ($d in $kill) {
+                    try { Remove-Item $d.FullName -Recurse -Force -ErrorAction Stop; $okN++ }
+                    catch { Write-Host "  [失败] $($d.Name)：$($_.Exception.Message)" -ForegroundColor Red }
+                }
+                Write-Host ""
+                Write-Host ("  已删除 {0} 次备份。" -f $okN) -ForegroundColor Green
+                Write-Host ""
+            }
             Pause-Safe
         }
         "0" { exit 0 }

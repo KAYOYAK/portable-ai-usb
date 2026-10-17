@@ -326,6 +326,42 @@ if (Test-Path $modelDst) {
     }
 }
 
+# ---------------- 5.5 模型校验清单 ----------------
+# 上面下载时验过一次哈希，但那个值只活在这次运行里。用户几个月后觉得「模型是不是
+# 坏了」时，手上没有任何基准。把实际哈希落到 models\校验.txt，tools\自检.ps1 拿它复查。
+Step 5.5 "模型校验清单"
+$manifest = Join-Path $dirModels "校验.txt"
+$old = @{}
+if (Test-Path $manifest) {
+    foreach ($ln in @(Get-Content $manifest -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        # 格式：<64位十六进制>  <字节数>  <文件名>
+        if ($ln -match '^\s*([0-9a-fA-F]{64})\s+(\d+)\s+(.+?)\s*$') {
+            $old[$Matches[3]] = @{ Hash = $Matches[1].ToLower(); Size = [long]$Matches[2] }
+        }
+    }
+}
+$mOut = @("# 模型校验清单 —— 由 tools\准备U盘.ps1 生成，tools\自检.ps1 用它复查文件有没有坏。",
+          "# 格式：<sha256>  <字节数>  <文件名>",
+          "")
+$mCount = 0
+$ggufs = @(Get-ChildItem $dirModels -Filter "*.gguf" -File -ErrorAction SilentlyContinue | Sort-Object Name)
+foreach ($g in $ggufs) {
+    $k = $old[$g.Name]
+    if ($k -and $k.Size -eq $g.Length) {
+        # 大小没变就沿用旧哈希：6 GB 算一遍要几十秒，装卸 U 盘时没必要重算。
+        $hv = $k.Hash
+        Info "$($g.Name) 沿用已有记录"
+    } else {
+        Info "正在算 $($g.Name) 的哈希（$([math]::Round($g.Length / 1GB, 2)) GB，会占一会儿 CPU）..."
+        try { $hv = (Get-FileHash $g.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+        catch { Warn "算不出来：$($_.Exception.Message)"; continue }
+    }
+    $mOut += ("{0}  {1}  {2}" -f $hv, $g.Length, $g.Name)
+    $mCount++
+}
+[IO.File]::WriteAllText($manifest, ($mOut -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+OK "校验.txt 已写入（$mCount 个模型）"
+
 # ---------------- 6. 启动器 ----------------
 Step 6 "启动器文件"
 # 启动AI.sh 是给 macOS / Linux 用的。这支 U 盘插到 Mac 上也要能用，

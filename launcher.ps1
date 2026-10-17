@@ -38,8 +38,8 @@ param(
                                    # 只在客户端自己没发 system 消息时补上；客户端带了就听客户端的。
     [switch]$ReadFiles,            # 让 AI 能自己读本地文件（只读：读文件、找文件、搜内容、看环境）。
                                    # 开着的时候它才能回答"这个文件里写了什么"，否则只能靠猜。
-    [switch]$AllowWrite,           # 在 -ReadFiles 之上再放开写文件、改文件、执行命令。
-                                   # 等于把这台电脑交给模型，只在隔离的机器上用。
+    [switch]$AllowWrite,           # 在 -ReadFiles 之上再放开写文件、改文件（不含执行命令）。
+                                   # 模型能直接改你的文件且不逐条询问，只放你让它动的文件。
     [string]$ToolDir = "",         # AI 能碰的目录。留空 = U 盘上的 workspace\。
                                    # 只有这个目录里的文件能被读到，外面的碰不到。
                                    # 目录名必须是纯英文数字，原因见下面 6.4。
@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.5.0"
+$AppVersion = "1.7.0"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -1373,7 +1373,7 @@ function Write-Settings {
             $lines += ""
             $lines += "读文件   :  开   （$scope）"
             $lines += "            AI 只能看见这个目录里的东西： $toolDir"
-            $lines += "            只读是默认；想改文件/执行命令要命令行加 -AllowWrite。"
+            $lines += "            只读是默认；想改文件要命令行加 -AllowWrite（菜单里是 [19]，要先打 YES）。"
             if ($Lan) { $lines += "            [注意] 开了读文件时，引擎只允许本机网页调用，局域网设备用不了。" }
         }
         if ($retryNote -and $retryNote.Count -gt 0) {
@@ -1719,12 +1719,78 @@ if ($ready) {
         Write-Host "   手机/平板同一个 wifi 打开： http://${lanIP}:$Port" -ForegroundColor Green
     }
     Write-Host ("=" * 64) -ForegroundColor Green
+
+    # 开了工具就真去敲一下。光靠"路径里有非英文字符"那条正则预警不够 ——
+    # 实测过：目录名带中文时 get_info 和 read_file 照常能用，但枚举类的
+    # file_glob_search / grep_search 一律 500（引擎列举目录走窄字符 Win32 API）。
+    # 这种"半死不活"只会在模型真用到时才暴露，用户看到的是"它答得很怪"。
+    if ($toolsOn) {
+        $probeOk  = $false
+        $probeMsg = ""
+        $probeExtra = ""
+        try {
+            $tl = @(Invoke-RestMethod "http://127.0.0.1:$Port/tools" -TimeoutSec 20)
+            $tn = @($tl | ForEach-Object { $_.tool })
+            if ($tn.Count -eq 0) { throw "引擎一个工具都没报出来" }
+            # Invoke-RestMethod 拒绝发送含非 ASCII 的请求头，所以只在路径是纯 ASCII
+            # 时才带 x-tool-cwd（和浏览器 UI 一致）；不带时引擎用自己的 CWD，
+            # 而 CWD 就是 $toolDir（Start-Engine 里设的），验的还是同一个地方。
+            $hdr = @{}
+            if (-not $toolNote -and $toolDir) { $hdr['x-tool-cwd'] = $toolDir }
+            $pb = @{ tool = 'get_info'; params = @{} } | ConvertTo-Json -Compress
+            $null = Invoke-RestMethod "http://127.0.0.1:$Port/tools" -Method Post `
+                -ContentType 'application/json; charset=utf-8' -Headers $hdr `
+                -Body ([Text.Encoding]::UTF8.GetBytes($pb)) -TimeoutSec 30
+            if ($tn -contains 'file_glob_search') {
+                $pb2 = @{ tool = 'file_glob_search'; params = @{ path = '.'; include = '*'; type = 'all'; limit = 5 } } |
+                       ConvertTo-Json -Depth 6 -Compress
+                $r2 = Invoke-RestMethod "http://127.0.0.1:$Port/tools" -Method Post `
+                    -ContentType 'application/json; charset=utf-8' -Headers $hdr `
+                    -Body ([Text.Encoding]::UTF8.GetBytes($pb2)) -TimeoutSec 30
+                $probeExtra = "，试着列了一下看见 $(@($r2.entries).Count) 项"
+            }
+            $probeMsg = "$($tn -join ', ') 可用$probeExtra"
+            $probeOk  = $true
+        } catch {
+            $probeMsg = $_.Exception.Message
+        }
+        if ($probeOk) {
+            Write-Host "   工具链   :  $probeMsg" -ForegroundColor DarkGray
+        } else {
+            Write-Host "   工具链   :  坏了 —— $probeMsg" -ForegroundColor Yellow
+            if ($toolNote) { Write-Host "               $toolNote" -ForegroundColor Yellow }
+            Write-Host "               读单个文件多半还能用；「列目录 / 搜索」会失败。" -ForegroundColor Yellow
+            Write-Host "               把文件放到纯英文路径下（或用 -ToolDir 指过去）再启动。" -ForegroundColor Yellow
+        }
+    }
+
+    # .backup\ 只增不减：每次启动开写权限都整目录复制一份，从不清。用得久了会
+    # 悄悄把 U 盘吃满，而用户没有任何线索。这里至少让他知道攒了多少。
+    if ($AllowWrite -and $toolDir) {
+        try {
+            $bkDir = Join-Path $toolDir ".backup"
+            if (Test-Path $bkDir) {
+                $bkSets = @(Get-ChildItem $bkDir -Directory -Force -ErrorAction SilentlyContinue)
+                if ($bkSets.Count -gt 0) {
+                    $bkFiles = @($bkSets | ForEach-Object {
+                        Get-ChildItem $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue })
+                    $bkMB = [math]::Round((($bkFiles | Measure-Object Length -Sum).Sum) / 1MB, 1)
+                    Write-Host ("   备份     :  {0} 次 / {1} 个文件 / {2} MB   （菜单 [21] 可以清）" -f $bkSets.Count, $bkFiles.Count, $bkMB) -ForegroundColor DarkGray
+                    if ($bkMB -ge 300) {
+                        Write-Host "               攒得有点多了，清一清能腾出几百 MB。" -ForegroundColor Yellow
+                    }
+                }
+            }
+        } catch { }
+    }
+
     # 引擎每次回答都会返回 timings，直接就有每秒 token 数 —— 不用开 --metrics。
     # 之前 tools\反馈报告.ps1 让用户手填"生成速度"，那是把我们自己能量的东西外包给用户。
     # 顺带把模型预热了：第一条真问题会比冷启动时快。
     if (-not $NoSpeedTest) {
         $tps = 0
         $pps = 0
+        $ttft = 0
         try {
             $sb = @{
                 messages    = @(@{ role = 'user'; content = '从1数到10，只写数字，用逗号隔开。' })
@@ -1737,15 +1803,22 @@ if ($ready) {
             if ($sr.timings) {
                 if ($sr.timings.predicted_per_second) { $tps = [double]$sr.timings.predicted_per_second }
                 if ($sr.timings.prompt_per_second)    { $pps = [double]$sr.timings.prompt_per_second }
+                # prompt_ms = 引擎处理"你这句话"花了多少毫秒。这才是用户真正的等待 ——
+                # 每 token 多快是吞吐，首字多久出来才是手感。上下文越长这个数越大。
+                if ($sr.timings.prompt_ms)            { $ttft = [double]$sr.timings.prompt_ms }
             }
         } catch { }
         if ($tps -gt 0) {
-            Write-Host ("   实测速度: {0:N1} token/秒   （提示处理 {1:N1}；单位是 token，中文约 1 字 = 0.6~1 token）" -f $tps, $pps) -ForegroundColor Green
+            $line = ("   实测速度: {0:N1} token/秒" -f $tps)
+            if ($ttft -gt 0) { $line += ("，首字 {0:N2} 秒" -f ($ttft / 1000)) }
+            $line += ("   （提示处理 {0:N1} token/秒；单位是 token，中文约 1 字 = 0.6~1 token）" -f $pps)
+            Write-Host $line -ForegroundColor Green
             try {
                 $sv = @(
                     "本机实测速度（启动器自动生成，$(Get-Date -Format 'yyyy-MM-dd HH:mm')）"
                     ""
                     ("生成速度 : {0:N1} token/秒" -f $tps)
+                    ("首字延迟 : {0:N2} 秒   （引擎处理你这句话的时间；对话越长它越大）" -f ($ttft / 1000))
                     ("提示处理 : {0:N1} token/秒" -f $pps)
                     ("后端     : $backendName")
                     ("上下文   : $Ctx tokens，KV $kvType")
@@ -1824,6 +1897,9 @@ if ($proc -and -not $proc.HasExited) {
                     $ctxWarned = $true
                     Write-Host ""
                     Write-Host ("  [快满了] 这段对话已用 {0} / {1} tokens（约 {2}%）。" -f $used, $Ctx, [math]::Round($used * 100 / $Ctx)) -ForegroundColor Yellow
+                    if ($pps -gt 0) {
+                        Write-Host ("  现在每问一句，光把你这段话读一遍就要约 {0:N1} 秒（按启动实测的 {1:N1} token/秒 估算）。" -f ($used / $pps), $pps) -ForegroundColor Yellow
+                    }
                     Write-Host "  再说下去最早的对话会被丢掉，建议开个新对话。" -ForegroundColor Yellow
                 }
             }

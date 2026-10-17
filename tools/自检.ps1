@@ -75,6 +75,49 @@ if ($mmprojFiles.Count -gt 0) {
     I ("视觉投影 {0}  ({1:N2} GB) —— 启动时会自动打开视觉能力" -f $mmprojFiles[0].Name, ($mmprojFiles[0].Length / 1GB))
 }
 
+# 模型完整性。准备U盘.ps1 下载时验过一次哈希，但那个值不落盘就随着脚本结束一起
+# 消失了 —— 用户几个月后怀疑文件坏了，手上没有任何基准可以比。所以它会把每个
+# 模型的实际哈希写进 models\校验.txt，这里读那份清单来复查。
+# 大小不符最省事；大小相符但哈希不同，才是真正隐蔽的那种损坏（镜像无视 Range
+# 拼出来的文件、以及存储介质自己烂掉，都会是这个样子）。
+$manifest = Join-Path $dirModels "校验.txt"
+if ($models.Count -gt 0) {
+    if (-not (Test-Path $manifest)) {
+        W "没有 models\校验.txt —— 没法确认模型文件是否完好（跑一次 tools\准备U盘.ps1 会生成）"
+    } else {
+        $known = @{}
+        foreach ($ln in @(Get-Content $manifest -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if ($ln -match '^\s*([0-9a-fA-F]{64})\s+(\d+)\s+(.+?)\s*$') {
+                $known[$Matches[3]] = @{ Hash = $Matches[1].ToLower(); Size = [long]$Matches[2] }
+            }
+        }
+        foreach ($m in $models) {
+            $k = $known[$m.Name]
+            if (-not $k) {
+                W "$($m.Name) 不在校验清单里 —— 清单是旧的，重跑 tools\准备U盘.ps1 可以补上"
+                continue
+            }
+            if ($k.Size -ne $m.Length) {
+                F ("{0} 大小不对：清单写 {1} 字节，实际 {2} 字节 —— 没下完整或被换过" -f $m.Name, $k.Size, $m.Length)
+                continue
+            }
+            Write-Host ("         正在算 {0} 的哈希（{1:N2} GB，要几十秒）..." -f $m.Name, ($m.Length / 1GB)) -ForegroundColor DarkGray
+            $swHash = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $h = (Get-FileHash $m.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+                $swHash.Stop()
+                if ($h -eq $k.Hash) {
+                    P ("{0} 完好（sha256 一致，耗时 {1:N0} 秒）" -f $m.Name, $swHash.Elapsed.TotalSeconds)
+                } else {
+                    F ("{0} 坏了：清单 {1}...，实际 {2}... —— 重新拷一份过来" -f $m.Name, $k.Hash.Substring(0, 12), $h.Substring(0, 12))
+                }
+            } catch {
+                F "$($m.Name) 读不出来：$($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 # 引擎
 $runtimeDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll")
 $dirLlama = Join-Path $Root "llama.cpp"
