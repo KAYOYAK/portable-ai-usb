@@ -39,6 +39,7 @@ DO_BENCH=0
 OPEN_BROWSER=1
 USE_SYSTEM_PROMPT=1     # 默认替客户端补一句"中文回答"，见下面的 DEFAULT_ZH_PROMPT
 CUSTOM_PROMPT=""        # --system-prompt 传进来的自定义句子
+PORT_SET=0              # 命令行有没有显式给 --port；给了就不读 端口设置.txt
 LAN=0                   # --lan：让同一个 wifi 里的手机也能连
 API_KEY=""              # --api-key：局域网模式下给接口上把锁
 
@@ -150,7 +151,7 @@ while [ $# -gt 0 ]; do
                       if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then
                           err "--port 要在 1~65535 之间，收到「$1」"; exit 1
                       fi
-                      PORT="$1" ;;
+                      PORT="$1"; PORT_SET=1 ;;
         --load-mode)  shift
                       case "${1:-}" in
                           auto|mmap|none|mlock|mmap+mlock|dio) LOAD_MODE="$1" ;;
@@ -175,6 +176,33 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# ---- U 盘根目录的设置文件（Windows 侧 高级选项.bat 的 [16] 写它们）----
+# 命令行优先：显式给了 --port / --system-prompt 就不读文件，
+# 免得临时指定被动过的文件悄悄盖掉。两个文件都不存在时行为完全不变。
+#
+# 注意 端口设置.txt 和 logs/端口.txt 不是一回事：
+#   端口设置.txt 是**输入**（你想要哪个号）
+#   logs/端口.txt 是**输出**（8080 被占用时自动换到了哪个号）
+PORT_FROM=""
+if [ "$PORT_SET" -eq 0 ] && [ -f "$ROOT/端口设置.txt" ]; then
+    _pt="$(tr -d ' \t\r\n' < "$ROOT/端口设置.txt" 2>/dev/null || true)"
+    case "$_pt" in
+        ''|*[!0-9]*) warn "端口设置.txt 里不是合法端口（要 1024~65535），这次仍用 $PORT" ;;
+        *)
+            if [ "$_pt" -ge 1024 ] && [ "$_pt" -le 65535 ]; then
+                PORT="$_pt"; PORT_FROM="端口设置.txt"
+            else
+                warn "端口设置.txt 里不是合法端口（要 1024~65535），这次仍用 $PORT"
+            fi
+            ;;
+    esac
+fi
+
+FILE_PROMPT=""
+if [ -f "$ROOT/系统提示.txt" ]; then
+    FILE_PROMPT="$(cat "$ROOT/系统提示.txt" 2>/dev/null | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+fi
 
 # ---------------------------------------------------------------- 平台
 OS="$(uname -s)"
@@ -464,6 +492,18 @@ case "$ENGINE" in
     *)         printf '  引擎     : %s  (系统里装的)\n' "$ENGINE" ;;
 esac
 
+# 引擎目录名顺便当"加速方式"显示。措辞跟 Windows 侧 launcher.ps1 的 $backendName 对齐，
+# 免得同一台机器上两个平台各说各话。
+BACKEND_SHOWN="$(basename "$(dirname "$ENGINE")")"
+BACKEND_FULL="$BACKEND_SHOWN"
+case "$BACKEND_SHOWN" in
+    *cuda*)          BACKEND_FULL="NVIDIA CUDA  (显卡加速)   [$BACKEND_SHOWN]" ;;
+    *vulkan*)        BACKEND_FULL="Vulkan  (AMD / Intel / 老NVIDIA 通用加速)   [$BACKEND_SHOWN]" ;;
+    *macos*|*metal*) BACKEND_FULL="Metal  (Apple 显卡加速)   [$BACKEND_SHOWN]" ;;
+    *cpu*|x64|arm64) BACKEND_FULL="纯 CPU  (兼容模式，慢)   [$BACKEND_SHOWN]" ;;
+    *)               BACKEND_FULL="$BACKEND_SHOWN  (不确定是哪份引擎，看目录名)" ;;
+esac
+
 # ---- 硬件 ----
 CPU_CORES="$( (command -v nproc >/dev/null 2>&1 && nproc) || sysctl -n hw.ncpu 2>/dev/null || printf 4)"
 THREADS=$(( CPU_CORES > 8 ? 8 : CPU_CORES ))
@@ -528,12 +568,17 @@ fi
 # 和 Windows 侧同一套做法：引擎没有"默认 system"这种参数，模型的模板里也没有对应变量，
 # 唯一可行的办法是借模型自己那份模板改三行。所以匹配不上就绝不硬套 ——
 # 换了模型还拿旧格式的模板去喂，输出会整段烂掉。
-DEFAULT_ZH_PROMPT="中文回答。回答必须全部是简体中文，不要出现英文单词。"
+DEFAULT_ZH_PROMPT="中文回答。不要出现英文单词。需要读文件就直接调工具。"
 TPL_FILE=""
 TPL_NOTE=""
 SYS_PROMPT=""
 if [ "$USE_SYSTEM_PROMPT" = 1 ]; then
-    if [ -n "$CUSTOM_PROMPT" ]; then SYS_PROMPT="$CUSTOM_PROMPT"; else SYS_PROMPT="$DEFAULT_ZH_PROMPT"; fi
+    # 优先级：--system-prompt > 系统提示.txt > 内置那句。
+    # 系统提示.txt 由 Windows 侧的 高级选项.bat [16] 写；也可以手写一个。
+    if   [ -n "$CUSTOM_PROMPT" ]; then SYS_PROMPT="$CUSTOM_PROMPT"; PROMPT_FROM="--system-prompt"
+    elif [ -n "$FILE_PROMPT" ];   then SYS_PROMPT="$FILE_PROMPT";   PROMPT_FROM="系统提示.txt"
+    else                               SYS_PROMPT="$DEFAULT_ZH_PROMPT"; PROMPT_FROM="内置默认"
+    fi
     if [ -d "$ROOT/templates" ]; then
         for _f in "$ROOT"/templates/*.jinja; do
             [ -f "$_f" ] || continue
@@ -613,6 +658,7 @@ else
 fi
 printf '  CPU 线程 : %s  (本机 %s 核)\n' "$THREADS" "$CPU_CORES"
 printf '  内存     : %s GB\n' "$RAM_GB"
+printf '  端口     : %s%s\n' "$PORT" "$([ -n "$PORT_FROM" ] && printf '  （来源：%s）' "$PORT_FROM")"
 [ "$LOAD_MODE" != "auto" ] && printf '  加载方式 : %s %s\n' "$LOAD_MODE" "$LOAD_NOTE"
 if [ "$LAN" = 1 ]; then
     printf '  局域网   : 开   ->   http://%s:%s\n' "$LAN_IP" "$PORT"
@@ -620,11 +666,55 @@ if [ "$LAN" = 1 ]; then
     [ -z "$API_KEY" ] && printf '              %s[注意] 没设钥匙，同一个网络里任何人都能用%s\n' "$C_WARN" "$C_OFF"
 fi
 if [ -n "$TPL_FILE" ] && [ -n "$SYS_PROMPT" ]; then
-    printf '  系统提示 : 开   %s(客户端没带 system 时补：%s)%s\n' "$C_DIM" "$SYS_PROMPT" "$C_OFF"
+    printf '  系统提示 : 开   %s(来源：%s；客户端没带 system 时补：%s)%s\n' "$C_DIM" "$PROMPT_FROM" "$SYS_PROMPT" "$C_OFF"
 elif [ "$USE_SYSTEM_PROMPT" = 0 ]; then
     printf '  系统提示 : 关   %s(--no-system-prompt)%s\n' "$C_DIM" "$C_OFF"
 fi
 [ -n "$TPL_NOTE" ] && printf '\n  %s[注意] %s%s\n' "$C_WARN" "$TPL_NOTE" "$C_OFF"
+
+# ---- 当前设置.txt ----
+# 和 Windows 侧同名同格式：一份人能读的"这次按什么配置跑的"。
+# 以前这些只在这块终端里出现过，关了就没了。
+_write_settings() {
+    _sf="$ROOT/当前设置.txt"
+    {
+        printf 'U盘 AI 便携版 —— 当前设置\n'
+        printf '（每次启动自动刷新，可以随时打开看；改这里没用，改完重启就被覆盖）\n'
+        printf '\n'
+        printf '生成时间 :  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf '启动位置 :  %s\n' "$ROOT"
+        printf '运行平台 :  %s %s\n' "$OS" "$ARCH"
+        printf '\n'
+        printf '模型     :  %s   (%s GB)\n' "$MODEL_BASE" "$MODEL_GB"
+        printf '加速方式 :  %s\n' "$BACKEND_FULL"
+        printf '上下文   :  %s tokens\n' "$CTX"
+        printf '显存卸载 :  %s 层   (KV 缓存 %s)\n' "$NGL" "${KV_SHOWN:-默认}"
+        printf 'CPU 线程 :  %s\n' "$THREADS"
+        printf '加载方式 :  %s\n' "$LOAD_MODE"
+        printf '端口     :  %s%s\n' "$PORT" "$([ -n "$PORT_FROM" ] && printf '   （来源：%s）' "$PORT_FROM")"
+        printf '网页界面 :  http://127.0.0.1:%s\n' "$PORT"
+        if [ "$LAN" = 1 ]; then
+            printf '局域网   :  开   ->   http://%s:%s\n' "$LAN_IP" "$PORT"
+        else
+            printf '局域网   :  关\n'
+        fi
+        printf '\n'
+        if [ -n "$TPL_FILE" ] && [ -n "$SYS_PROMPT" ]; then
+            printf '系统提示 :  开   （来源：%s）\n' "$PROMPT_FROM"
+            printf '            只在客户端自己没发 system 消息时补上；\n'
+            printf '            客户端带了就听客户端的，不会被覆盖、也不会重复注入。\n'
+            printf '\n'
+            printf '            原文： %s\n' "$SYS_PROMPT"
+            printf '\n'
+            printf '            想改：直接编辑 %s/系统提示.txt 后重启。\n' "$ROOT"
+        elif [ "$USE_SYSTEM_PROMPT" = 0 ]; then
+            printf '系统提示 :  关   （--no-system-prompt，模型按自己的脾气挑语言）\n'
+        else
+            printf '系统提示 :  关   （没找到匹配这个模型的模板，见 templates/）\n'
+        fi
+    } > "$_sf" 2>/dev/null || true
+}
+_write_settings
 
 if [ "$DO_PROBE" = 1 ]; then
     head_line "探测完成（没有真的启动引擎）"

@@ -33,8 +33,15 @@ param(
     [int]$MaxRetry = 2,            # 显存/内存不足时自动降档重试的次数上限。
                                    # 0 = 不重试，直接报错退出。
     [switch]$NoSystemPrompt,       # 关掉默认的中文系统提示（模型会按自己的脾气挑语言）
-    [string]$SystemPrompt = ""     # 自定义默认系统提示。留空 = 用内置那句"始终用简体中文"。
+    [string]$SystemPrompt = "",    # 自定义默认系统提示。留空 = 用内置那句"始终用简体中文"。
                                    # 只在客户端自己没发 system 消息时补上；客户端带了就听客户端的。
+    [switch]$ReadFiles,            # 让 AI 能自己读本地文件（只读：读文件、找文件、搜内容、看环境）。
+                                   # 开着的时候它才能回答"这个文件里写了什么"，否则只能靠猜。
+    [switch]$AllowWrite,           # 在 -ReadFiles 之上再放开写文件、改文件、执行命令。
+                                   # 等于把这台电脑交给模型，只在隔离的机器上用。
+    [string]$ToolDir = ""          # AI 能碰的目录。留空 = U 盘上的 workspace\。
+                                   # 只有这个目录里的文件能被读到，外面的碰不到。
+                                   # 目录名必须是纯英文数字，原因见下面 6.4。
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +53,33 @@ $Root = $PSScriptRoot
 if (-not $Root) { $Root = Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $Root) { $Root = (Get-Location).Path }
 $Root = $Root.TrimEnd('\')
+
+# ---------------- 端口可以由 U 盘根目录的 端口设置.txt 覆盖 ----------------
+# 高级选项.bat 的 [16] 写这个文件。命令行 -Port 仍然优先 —— 临时指定不该被动过的
+# 文件悄悄盖掉。放在这里是因为下面的 $Root 才知道文件在哪，而端口到 6.x 才用。
+#
+# 注意别和 logs\端口.txt 搞混：那个是**输出** —— 8080 被占用时启动器自动换号，
+# 换到哪写在哪（Open-WebUI 读它）。这个 端口设置.txt 是**输入**，写的是你想要哪个号。
+$portFrom = ""
+if ($PSBoundParameters.ContainsKey('Port')) {
+    $portFrom = "命令行 -Port"
+} else {
+    $portFile = Join-Path $Root "端口设置.txt"
+    if (Test-Path $portFile) {
+        try {
+            $pt = (Get-Content $portFile -Raw -Encoding UTF8).Trim()
+            $pn = 0
+            if ([int]::TryParse($pt, [ref]$pn) -and $pn -ge 1024 -and $pn -le 65535) {
+                $Port = $pn
+                $portFrom = "端口设置.txt"
+            } else {
+                Write-Host "  [注意] 端口设置.txt 里不是合法端口（要 1024~65535），这次仍用 $Port" -ForegroundColor Yellow
+            }
+        } catch {
+            # 文件读不动就当没设过，不该拦住启动
+        }
+    }
+}
 
 $DirModels = Join-Path $Root "models"
 $DirLlama  = Join-Path $Root "llama.cpp"
@@ -763,12 +797,29 @@ function Get-ModelTemplate([string]$ModelFileName) {
 #   「无论用户用什么语言提问，你都只能用简体中文回答，不要使用英文。」 → 全英文
 #   「你是中文助手，回答一律使用简体中文，禁止英文。」            → 全英文
 #   「优先用简体中文回答；用户明确指定别的语言时听用户的。」        → 全英文
-#   「中文回答。回答必须全部是简体中文，不要出现英文单词。」        → 4/4 中文 ✓
-# 最后这句还**不会跟用户抢**：用户明说 "answer in English" 时它照样用英文（0/2 中文）。
+#   「中文回答。回答必须全部是简体中文，不要出现英文单词。」        → 中文 3/5 ✓
+# 这一句还**不会跟用户抢**：用户明说 "answer in English" 时它照样用英文（0/2 中文）。
 # 9B 模型对客气的长句基本不理会，只对短、直、动词开头的祈使句有反应。
-$DefaultChinesePrompt = "中文回答。回答必须全部是简体中文，不要出现英文单词。"
+#
+# 但它和「让 AI 读文件」会打架，2026-10-17 测出来的：
+#   用户问「项目.txt 里写的交付日期是哪天？直接告诉我日期。」时，这句 0/5 不调工具
+#   —— 后半截在叫它"别查，直接说"，它就真不查，然后编一句"我还没看到这个文件"。
+#   换成下面这句，同一条问题 5/5 都调工具，语言那关一分没掉（还是 3/5）。
+# 只加一句"需要读文件就直接调工具"就够 —— 它把"别查"那句顶回去了。
+# 不改的话，装了 [15] 读文件功能的 U 盘，用户越催"直接告诉我"，越容易拿到编的答案。
+$DefaultChinesePrompt = "中文回答。不要出现英文单词。需要读文件就直接调工具。"
+# 想让「改系统提示」能落盘，就得有个文件 —— U 盘根目录的 系统提示.txt。
+# 优先级：命令行 -SystemPrompt > 系统提示.txt > 内置那句。
+# -NoSystemPrompt 压过一切（那是明确说"别注入"）。
+$SysPromptFile = Join-Path $Root "系统提示.txt"
+$filePrompt = ""
+if (Test-Path $SysPromptFile) {
+    try { $filePrompt = (Get-Content $SysPromptFile -Raw -Encoding UTF8).Trim() } catch { $filePrompt = "" }
+}
+
 if ($NoSystemPrompt)   { $sysPrompt = "" }
 elseif ($SystemPrompt) { $sysPrompt = $SystemPrompt }
+elseif ($filePrompt)   { $sysPrompt = $filePrompt }
 else                   { $sysPrompt = $DefaultChinesePrompt }
 
 $tplFile  = $null
@@ -778,6 +829,41 @@ if ($sysPrompt) {
     if (-not $tplFile) {
         $tplNote = "想让模型默认说中文，但 templates\ 里没有匹配 $($model.Name) 的模板 —— 本次不注入，模型自己挑语言。"
         $sysPrompt = ""
+    }
+}
+
+# ---------------- 6.4 让 AI 读文件 ----------------
+# 引擎自己的内置工具。开了以后：客户端带 tools 数组发请求 → 模型回一个 tool_call →
+# 客户端把 tool_call 发给引擎的 POST /tools → **引擎**在自己的进程里执行、把结果读回给模型。
+# 所以能读到哪些文件，由引擎的工作目录决定 —— 这是唯一的边界，必须钉死在一个目录上。
+#
+# 这个目录名必须是纯 ASCII。实测（引擎 cuda13 版）：
+#   CWD = E:\工作区   →  read_file 能读出来（走宽字符路径），
+#                        file_glob_search / grep_search 一律 500：
+#                        "No mapping for the Unicode character exists in the target multi-byte code page."
+#   CWD = E:\wsA     →  四个工具全部正常，文件名叫「项目.txt」也照样能列能搜
+# 也就是说：引擎列举目录那一步走的是窄字符 Win32 API，路径里有非 ASCII 就崩。
+# 这是引擎的毛病，不是我们的，但落哪个目录是我们定的 —— 所以默认用英文名绕开它。
+# 目录里面的**文件名**随便用中文，不受影响。
+#
+# 默认只开只读的四件。剩下的 write_file / edit_file / exec_shell_command 能改文件、
+# 能执行命令，等于把这台电脑交出去，要人明确说 -AllowWrite 才放。
+$toolsOn  = $ReadFiles -or $AllowWrite
+$toolDir  = $null
+$toolNote = $null
+if ($toolsOn) {
+    $want = if ($ToolDir) { $ToolDir } else { Join-Path $Root "workspace" }
+    try {
+        if (-not (Test-Path $want)) { New-Item -ItemType Directory -Force -Path $want | Out-Null }
+        $toolDir = (Resolve-Path $want).Path
+        $bad = [regex]::Match($toolDir, '[^\x20-\x7E]')
+        if ($bad.Success) {
+            $toolNote = "目录「$toolDir」的路径里有非英文字符，引擎会列不出文件（读单个文件仍可以）。" +
+                        "建议换成纯英文路径，例如 $Root\workspace。"
+        }
+    } catch {
+        $toolNote = "想让 AI 读文件，但建不出目录「$want」—— 本次不开启读文件。"
+        $toolsOn = $false
     }
 }
 
@@ -819,6 +905,11 @@ function Build-Args {
         $kw = (@{ default_system = $sysPrompt } | ConvertTo-Json -Compress) -replace '"', '\"'
         $a += @("--chat-template-file", $tplFile, "--chat-template-kwargs", $kw)
     }
+    # 内置工具。名字必须和引擎的清单完全一致，写错一个引擎会直接报错退出。
+    if ($toolsOn) {
+        $list = if ($AllowWrite) { "all" } else { "read_file,file_glob_search,grep_search,get_info" }
+        $a += @("--tools", $list)
+    }
     return $a
 }
 
@@ -833,6 +924,7 @@ Write-Host ""
 Write-Host "  上下文   :  $Ctx tokens" -ForegroundColor DarkGray
 Write-Host "  显存卸载 :  $Ngl 层  (KV 缓存 $kvType)" -ForegroundColor DarkGray
 Write-Host "  CPU 线程 :  $threads" -ForegroundColor DarkGray
+Write-Host "  端口     :  $Port$(if ($portFrom) { "   （来源：$portFrom）" })" -ForegroundColor DarkGray
 if ($LoadMode -ne "auto") {
     Write-Host "  加载方式 :  $LoadMode" -ForegroundColor DarkGray
 }
@@ -853,6 +945,19 @@ if ($tplFile -and $sysPrompt) {
 } elseif ($NoSystemPrompt) {
     Write-Host "  系统提示 :  关   (-NoSystemPrompt)" -ForegroundColor DarkGray
 }
+if ($toolsOn) {
+    $scope = if ($AllowWrite) { "读 + 写 + 执行命令" } else { "只读" }
+    Write-Host "  读文件   :  开   ($scope)   ->   $toolDir" -ForegroundColor Green
+    Write-Host "              AI 只能看见这个目录里的东西；把要问的文件放进去" -ForegroundColor DarkGray
+    if ($Lan) {
+        Write-Host "              [注意] 引擎为了安全，开了读文件就只允许本机网页调用 —— " -ForegroundColor Yellow
+        Write-Host "                     同一个 wifi 的手机能聊天，但用不了读文件。" -ForegroundColor Yellow
+    }
+}
+if ($toolNote) {
+    Write-Host ""
+    Write-Host "  [注意] $toolNote" -ForegroundColor Yellow
+}
 if ($tplNote) {
     Write-Host ""
     Write-Host "  [注意] $tplNote" -ForegroundColor Yellow
@@ -869,6 +974,74 @@ if ($loadNote) {
     Write-Host ""
     Write-Host "  [注意] $loadNote" -ForegroundColor Yellow
 }
+
+# ---------------- 6.9 把"这次到底按什么配置跑的"落成一份人能读的文件 ----------------
+# 这些东西以前只在这块黑底窗口里出现过，窗口一关就没了 —— 用户想问"它为什么自动说中文"
+# 或者"我上下文设的是多少"，得凭记忆复述。落盘以后随时能用记事本打开看。
+# 写成函数是因为降档重试会改 $Ctx/$kvType/$backendName，就绪后要再刷一次，
+# 不然文件里写的还是降档前的配置。
+$settingsPath = Join-Path $Root "当前设置.txt"
+function Write-Settings {
+    try {
+        $lines = @(
+            "U盘 AI 便携版 —— 当前设置",
+            "（每次启动自动刷新，可以随时用记事本打开看；改这里没用，改完重启就被覆盖）",
+            "",
+            "生成时间 :  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+            "启动位置 :  $Root",
+            "",
+            "模型     :  $($model.Name)   ($([math]::Round($modelGB,2)) GB)",
+            "加速方式 :  $backendName",
+            "上下文   :  $Ctx tokens",
+            "显存卸载 :  $Ngl 层   (KV 缓存 $kvType)",
+            "CPU 线程 :  $threads",
+            "加载方式 :  $(if ($LoadMode -eq 'auto') { 'auto（按需分页，省内存）' } else { $LoadMode })",
+            "端口     :  $Port$(if ($portFrom) { "   （来源：$portFrom）" })",
+            "网页界面 :  http://127.0.0.1:$Port"
+        )
+        if ($Lan -and $lanIP) {
+            $lines += "局域网   :  开   ->   http://${lanIP}:$Port"
+        } else {
+            $lines += "局域网   :  关"
+        }
+        if ($tplFile -and $sysPrompt) {
+            $from = if ($SystemPrompt) { "命令行 -SystemPrompt" }
+                    elseif ($filePrompt) { "系统提示.txt" }
+                    else { "内置默认" }
+            $lines += ""
+            $lines += "系统提示 :  开   （来源：$from）"
+            $lines += "            只在客户端自己没发 system 消息时补上；"
+            $lines += "            客户端带了就听客户端的，不会被覆盖、也不会重复注入。"
+            $lines += ""
+            $lines += "            原文： $sysPrompt"
+            $lines += ""
+            $lines += "            想改：高级选项.bat 选 [16]；也可以直接编辑 $SysPromptFile 后重启。"
+        } elseif ($NoSystemPrompt) {
+            $lines += ""
+            $lines += "系统提示 :  关   （-NoSystemPrompt，模型按自己的脾气挑语言）"
+        } else {
+            $lines += ""
+            $lines += "系统提示 :  关   （没找到匹配这个模型的模板，见 templates\）"
+        }
+        if ($toolsOn) {
+            $scope = if ($AllowWrite) { "读 + 写 + 执行命令（-AllowWrite）" } else { "只读" }
+            $lines += ""
+            $lines += "读文件   :  开   （$scope）"
+            $lines += "            AI 只能看见这个目录里的东西： $toolDir"
+            $lines += "            只读是默认；想改文件/执行命令要命令行加 -AllowWrite。"
+            if ($Lan) { $lines += "            [注意] 开了读文件时，引擎只允许本机网页调用，局域网设备用不了。" }
+        }
+        if ($retryNote -and $retryNote.Count -gt 0) {
+            $lines += ""
+            $lines += "启动时自动降过档："
+            foreach ($n in $retryNote) { $lines += "  - $n" }
+        }
+        [IO.File]::WriteAllText($settingsPath, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding($true)))
+    } catch {
+        # 写不进去（写保护的盘）不该拦住启动，静默跳过
+    }
+}
+Write-Settings
 
 if ($Probe) {
     Head "探测完成（未启动引擎）"
@@ -980,8 +1153,11 @@ function Clear-Progress {
 }
 
 function Start-Engine {
+    # 开工具时把引擎的工作目录钉在 $toolDir —— 内置工具读的是相对路径，
+    # 引擎的 CWD 就是 AI 能看见的全部世界。模型、模板、日志全走绝对路径，不受影响。
+    $wd = if ($toolDir) { $toolDir } else { Split-Path $exe -Parent }
     return (Start-Process -FilePath $exe -ArgumentList $llamaArgs `
-            -WorkingDirectory (Split-Path $exe -Parent) `
+            -WorkingDirectory $wd `
             -RedirectStandardOutput ($log + ".out") `
             -RedirectStandardError  $log `
             -PassThru -NoNewWindow)
@@ -1122,9 +1298,12 @@ if ($ready) {
         foreach ($n in $retryNote) { Write-Host "   - $n" -ForegroundColor Yellow }
         Write-Host ""
     }
+    # 降档改过 $Ctx/$kvType/$backendName，刷一次让 当前设置.txt 和实际跑的一致
+    Write-Settings
     Write-Host ("=" * 64) -ForegroundColor Green
     Write-Host "   AI 已就绪   ->   $url" -ForegroundColor Green
     Write-Host "   后端: $backendName   上下文: $Ctx   KV: $kvType" -ForegroundColor Green
+    Write-Host "   本次设置已写到 当前设置.txt（想知道它为什么自动说中文，翻这个）" -ForegroundColor DarkGray
     if ($Lan -and $lanIP) {
         Write-Host "" 
         Write-Host "   手机/平板同一个 wifi 打开： http://${lanIP}:$Port" -ForegroundColor Green

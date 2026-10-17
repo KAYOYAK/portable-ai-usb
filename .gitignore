@@ -3,6 +3,16 @@ logs/
 *.log
 models/
 llama.cpp/
+workspace/
+
+# 每次启动自动重写 / 一键生成，不是源文件
+当前设置.txt
+反馈报告.txt
+
+# 用户自己的设置（高级选项.bat 的 [16] 写它们）。
+# 刻意不进仓库：否则 git pull 会把别人 U 盘上的设置盖掉。
+端口设置.txt
+系统提示.txt
 
 # 下载缓存
 tools/*.zip
