@@ -39,10 +39,25 @@ param(
                                    # 开着的时候它才能回答"这个文件里写了什么"，否则只能靠猜。
     [switch]$AllowWrite,           # 在 -ReadFiles 之上再放开写文件、改文件、执行命令。
                                    # 等于把这台电脑交给模型，只在隔离的机器上用。
-    [string]$ToolDir = ""          # AI 能碰的目录。留空 = U 盘上的 workspace\。
+    [string]$ToolDir = "",         # AI 能碰的目录。留空 = U 盘上的 workspace\。
                                    # 只有这个目录里的文件能被读到，外面的碰不到。
                                    # 目录名必须是纯英文数字，原因见下面 6.4。
+    [switch]$NoSnapshot,           # -AllowWrite 时默认会把 workspace\ 备份一份、关掉时
+                                   # 列出 AI 新写/改/删了哪些文件。这个开关把备份省掉
+                                   # （仍会列出改动，只是不能回退）。
+    # ---- 采样参数。留空 = 读 参数设置.txt，再没有就用内置默认 ----
+    # 用 $PSBoundParameters 判断"有没有给"，不能拿 0 或 -1 当哨兵：
+    # temp=0 是合法值（要确定性输出的人天天用），拿 0 当"没设"会让 --temp 0 静默失效。
+    [double]$Temp = 0,             # 0~2    越低越稳、越高越发散
+    [double]$TopP = 0,             # 0~1
+    [int]$TopK = -1,               # 0~200  0 = 关掉
+    [double]$MinP = 0,             # 0~1
+    [double]$RepeatPenalty = 0,    # 0.5~2  1.0 = 关掉
+    [int]$NPredict = 0,            # -1 = 不限；1~32768 = 每条回答最多这么多 token
+    [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
+
+$AppVersion = "1.5.0"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -832,6 +847,94 @@ if ($sysPrompt) {
     }
 }
 
+# ---------------- 6.3 采样参数 ----------------
+# 这些以前是写死在 Build-Args 里的（--temp 0.6 / --top-p 0.95 ...）。值本身是调过的，
+# 但用户改不了：「回答太啰嗦」「太发散」「老是重复」只能忍着。改成两条路可配。
+#
+# 优先级：命令行 > 参数设置.txt > 内置默认。
+#
+# 范围校验放在这里，不扔给引擎：引擎收到离谱的值（比如 temp=-1）是直接退出，
+# 用户看到的只有一行 "exited"，没有线索。这里拦住并说清楚哪个键、错在哪。
+$ParamDefaults = [ordered]@{
+    temp           = 0.6
+    top_p          = 0.95
+    top_k          = 20
+    min_p          = 0.0
+    repeat_penalty = 1.1
+    n_predict      = -1
+}
+$ParamRanges = @{
+    temp           = @(0.0, 2.0)
+    top_p          = @(0.0, 1.0)
+    top_k          = @(0, 200)
+    min_p          = @(0.0, 1.0)
+    repeat_penalty = @(0.5, 2.0)
+    n_predict      = @(-1, 32768)
+}
+$ParamFile = Join-Path $Root "参数设置.txt"
+$sample = [ordered]@{}
+foreach ($k in $ParamDefaults.Keys) { $sample[$k] = $ParamDefaults[$k] }
+$sampleFrom = @{}
+$sampleNote = @()
+
+# 命令行走 $PSBoundParameters，不走哨兵值。见参数声明处的说明。
+$cliMap = [ordered]@{
+    temp = 'Temp'; top_p = 'TopP'; top_k = 'TopK'
+    min_p = 'MinP'; repeat_penalty = 'RepeatPenalty'; n_predict = 'NPredict'
+}
+foreach ($k in $cliMap.Keys) {
+    if ($PSBoundParameters.ContainsKey($cliMap[$k])) {
+        $sample[$k] = $PSBoundParameters[$cliMap[$k]]
+        $sampleFrom[$k] = "命令行 -$($cliMap[$k])"
+    }
+}
+
+if (Test-Path $ParamFile) {
+    try {
+        $ln = 0
+        foreach ($raw in [IO.File]::ReadAllLines($ParamFile)) {
+            $ln++
+            $line = $raw.Trim()
+            if (-not $line) { continue }
+            if ($line.StartsWith('#')) { continue }
+            # 半角 = 或 : 或全角 ＝ 都认 —— 用户从聊天窗口复制参数时经常带全角
+            $m = [regex]::Match($line, '^([A-Za-z_]+)\s*[=:＝：]\s*(.+)$')
+            if (-not $m.Success) {
+                $sampleNote += "参数设置.txt 第 $ln 行看不懂，跳过：$line"
+                continue
+            }
+            $k = $m.Groups[1].Value.Trim().ToLower()
+            $v = $m.Groups[2].Value.Trim()
+            if (-not $ParamDefaults.Contains($k)) {
+                $sampleNote += "参数设置.txt 第 $ln 行的键「$k」不认识，跳过（认识的：$($ParamDefaults.Keys -join ', ')）"
+                continue
+            }
+            if ($sampleFrom.ContainsKey($k)) { continue }    # 命令行已经给了，文件不覆盖
+            $num = 0.0
+            $parsed = [double]::TryParse($v,
+                [System.Globalization.NumberStyles]::Float,
+                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$num)
+            if (-not $parsed) {
+                $sampleNote += "参数设置.txt 第 $ln 行「$k = $v」不是数字，跳过"
+                continue
+            }
+            $lo = $ParamRanges[$k][0]; $hi = $ParamRanges[$k][1]
+            if ($num -lt $lo -or $num -gt $hi) {
+                $sampleNote += "参数设置.txt 第 $ln 行「$k = $v」超出范围（$lo ~ $hi），跳过"
+                continue
+            }
+            $sample[$k] = $num
+            $sampleFrom[$k] = "参数设置.txt"
+        }
+    } catch {
+        # 读不动就用默认值，不该拦住启动
+    }
+}
+
+# 传给引擎的数字必须用不变文化格式。中文区域的小数点也是 "."，但别的区域未必，
+# 拼成 "0,6" 引擎会当成两个参数 —— 这种错只在某些机器上出现，最难查。
+function Inv([double]$v) { return $v.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+
 # ---------------- 6.4 让 AI 读文件 ----------------
 # 引擎自己的内置工具。开了以后：客户端带 tools 数组发请求 → 模型回一个 tool_call →
 # 客户端把 tool_call 发给引擎的 POST /tools → **引擎**在自己的进程里执行、把结果读回给模型。
@@ -849,10 +952,13 @@ if ($sysPrompt) {
 # 默认只开只读的四件。剩下的 write_file / edit_file / exec_shell_command 能改文件、
 # 能执行命令，等于把这台电脑交出去，要人明确说 -AllowWrite 才放。
 $toolsOn  = $ReadFiles -or $AllowWrite
+# PowerShell 变量名不区分大小写：$ToolDir（参数）和 $toolDir（局部）是同一个变量。
+# 下面一行的 $toolDir = $null 会把传进来的参数冲掉 —— 先把参数抄到另一个名字再清。
+$toolWant = $ToolDir
 $toolDir  = $null
 $toolNote = $null
 if ($toolsOn) {
-    $want = if ($ToolDir) { $ToolDir } else { Join-Path $Root "workspace" }
+    $want = if ($toolWant) { $toolWant } else { Join-Path $Root "workspace" }
     try {
         if (-not (Test-Path $want)) { New-Item -ItemType Directory -Force -Path $want | Out-Null }
         $toolDir = (Resolve-Path $want).Path
@@ -867,6 +973,108 @@ if ($toolsOn) {
     }
 }
 
+# 开了工具就补一句「环境是什么、该用哪个工具」。
+# 实测依据：同一句「todo.txt 里有什么」，不补这句时模型先猜 /home/user/todo.txt、
+# 再 `pwd && ls -la`、再 `find /`，5 次调用全废；补了以后 1 次 read_file 就拿到了。
+# 改文件那半句更要紧：不点名它就会拿 exec_shell_command 去 echo 追加，
+# 而那是 Windows cmd，中文落盘成 `'- ???? '`，文件直接被写坏。
+# 只在开了工具时追加 —— 没工具时提"调工具"就是骗模型。
+$ToolHint = "文件都在当前目录，路径直接写文件名就行。这个系统是 Windows。" +
+            "改文件用 write_file 或 edit_file，不要用命令行改。"
+if ($toolsOn -and $sysPrompt) {
+    $sysPrompt = $sysPrompt + $ToolHint
+}
+
+# ---------------- 6.5 开了写权限时，让改动看得见 ----------------
+# 只读是安全的一半；另一半是「它改了什么我能知道，还能退回去」。
+# 以前 -AllowWrite 只能从命令行开，因为菜单里给一个数字就等于把电脑交出去。
+# 加上下面这套以后，菜单里给入口是合理的：
+#   1) 启动前把 workspace\ 里现有文件备份到 workspace\.backup\<时间戳>\
+#   2) 关掉时比对哈希，打印 AI 新写/改/删了哪些
+# 备份有上限：超过 500 个文件或 500 MB 就只备份前一部分并说明 —— 备份本身
+# 不该把 U 盘塞满，也不该让启动卡几分钟。
+$snapBefore = $null
+$snapDir    = $null
+
+# 目录指纹：相对路径 -> "字节数:修改时间"。
+# 不用哈希：判断"变没变"够用，也不必把每个文件都完整读一遍。
+function Get-FileStamp([string]$Dir) {
+    $map = @{}
+    if (-not $Dir) { return $map }
+    if (-not (Test-Path -LiteralPath $Dir)) { return $map }
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        if ($f.FullName -like '*\.backup\*') { continue }
+        $map[$f.FullName.Substring($Dir.Length).TrimStart('\')] = "$($f.Length):$($f.LastWriteTimeUtc.Ticks)"
+    }
+    return $map
+}
+
+if ($AllowWrite -and $toolDir) {
+    try {
+        $snapDir = Join-Path $toolDir (".backup\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        New-Item -ItemType Directory -Force -Path $snapDir | Out-Null
+        $files = @(Get-ChildItem -LiteralPath $toolDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -notlike '*\.backup\*' })
+        $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+        if ($files.Count -gt 500 -or $totalBytes -gt 500MB) {
+            Write-Host "  [注意] workspace\ 里文件太多（$($files.Count) 个 / $([math]::Round($totalBytes/1MB)) MB），" -ForegroundColor Yellow
+            Write-Host "         只备份前 500 个且总量不超过 500 MB。没备份到的改动，关掉时只能看见、退不回。" -ForegroundColor Yellow
+        }
+        $copied = 0
+        foreach ($f in $files) {
+            if ($copied -ge 500) { break }
+            $rel = $f.FullName.Substring($toolDir.Length).TrimStart('\')
+            $dst = Join-Path $snapDir $rel
+            $d   = Split-Path -Parent $dst
+            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+            Copy-Item -LiteralPath $f.FullName -Destination $dst -Force -ErrorAction SilentlyContinue
+            $copied++
+        }
+        if ($copied -gt 0) {
+            Write-Host "  已备份 :  $copied 个文件 -> $snapDir" -ForegroundColor DarkGray
+        }
+    } catch {
+        $snapDir = $null
+    }
+    $snapBefore = Get-FileStamp $toolDir
+}
+
+# 关掉时调一次。引擎退出、Ctrl+C、异常退出都走这里（写在最外层，
+# 因为 PowerShell 的 Ctrl+C 会直接终止管道，finally 未必跑得到 —— 所以这里
+# 只是"正常情况下"的汇报，不作为安全保证）。
+function Show-WorkspaceDiff {
+    if (-not $AllowWrite -or -not $toolDir) { return }
+    # 快照没拿到就退回用备份目录当基线 —— 备份落在盘上，比内存里的快照可靠。
+    $before = $snapBefore
+    if (($null -eq $before -or $before.Count -eq 0) -and $snapDir -and (Test-Path -LiteralPath $snapDir)) {
+        $before = Get-FileStamp $snapDir
+    }
+    if ($null -eq $before) { $before = @{} }
+    $after = Get-FileStamp $toolDir
+    $new   = @($after.Keys  | Where-Object { -not $before.ContainsKey($_) })
+    $gone  = @($before.Keys | Where-Object { -not $after.ContainsKey($_) })
+    $edit  = @($after.Keys  | Where-Object { $before.ContainsKey($_) -and $before[$_] -ne $after[$_] })
+    if ($new.Count + $gone.Count + $edit.Count -eq 0) {
+        Write-Host "  AI 没有改动 workspace\ 里的任何文件。" -ForegroundColor DarkGray
+        return
+    }
+    Write-Host ""
+    Write-Host ("=" * 64) -ForegroundColor Yellow
+    Write-Host "  AI 动过的文件" -ForegroundColor Yellow
+    Write-Host ("=" * 64) -ForegroundColor Yellow
+    foreach ($x in $new)  { Write-Host "  新写  $x" -ForegroundColor Green }
+    foreach ($x in $edit) { Write-Host "  改动  $x" -ForegroundColor Yellow }
+    foreach ($x in $gone) { Write-Host "  删除  $x" -ForegroundColor Red }
+    if ($snapDir) {
+        Write-Host ""
+        Write-Host "  改之前的版本在： $snapDir" -ForegroundColor DarkGray
+        Write-Host "  想退回去，把那个目录里的文件复制回 workspace\ 覆盖即可。" -ForegroundColor DarkGray
+    } else {
+        Write-Host ""
+        Write-Host "  这次没做备份（-NoSnapshot 或备份目录建不出来），只能看见改动、退不回去。" -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
 # ---------------- 6. 拼参数 ----------------
 # 参数要拼两次：第一次按原配置，降档重试时按新配置。只留这一份拼装逻辑 ——
 # 之前降档那段是手抄一遍的，后来加的开关（多模态、默认系统提示、局域网钥匙）
@@ -882,10 +1090,12 @@ function Build-Args {
         "--threads", "$threads",
         "--jinja",
         "--reasoning-format", "deepseek",
-        "--temp", "0.6",
-        "--top-p", "0.95",
-        "--top-k", "20",
-        "--min-p", "0"
+        "--temp",   (Inv $sample.temp),
+        "--top-p",  (Inv $sample.top_p),
+        "--top-k",  "$([int]$sample.top_k)",
+        "--min-p",  (Inv $sample.min_p),
+        "--repeat-penalty", (Inv $sample.repeat_penalty),
+        "--n-predict", "$([int]$sample.n_predict)"
     )
     # 纯 CPU 跑时没有 CUDA/Vulkan 后端，--flash-attn 和 KV 量化都是显卡侧的东西。
     if ($backend -ne "cpu") {
@@ -901,19 +1111,39 @@ function Build-Args {
     }
     # 默认系统提示：模型自己的模板 + 一个模板变量。JSON 里的引号会在 Windows 拼
     # 命令行时被吃掉（引擎报 "invalid literal; last read: '{d'"），必须转成 \" 再传。
+    #
+    # 整段还要再用双引号包一层 —— Start-Process 的 -ArgumentList 是「按空格 join」，
+    # 不负责给每个参数加引号。提示里只要出现空格（比如"用 write_file 或 edit_file"），
+    # 不包引号就会被拆成好几个 argv，引擎收到半截 JSON 然后退出：
+    #   error while handling argument "--chat-template-kwargs": [json.exception.parse_error.101]
+    #   ... missing closing quote; last read: '"中文回答。……这个系统是'
+    # 短提示里全是中文标点、没有空格，所以这个坑一直没露头。
     if ($sysPrompt -and $tplFile) {
         $kw = (@{ default_system = $sysPrompt } | ConvertTo-Json -Compress) -replace '"', '\"'
-        $a += @("--chat-template-file", $tplFile, "--chat-template-kwargs", $kw)
+        $a += @("--chat-template-file", $tplFile, "--chat-template-kwargs", ('"{0}"' -f $kw))
     }
     # 内置工具。名字必须和引擎的清单完全一致，写错一个引擎会直接报错退出。
     if ($toolsOn) {
-        $list = if ($AllowWrite) { "all" } else { "read_file,file_glob_search,grep_search,get_info" }
+        # 写模式**故意不给 exec_shell_command**：
+        #   实测（shopping-list 那次）模型改文件首选的是 shell，而这里执行的是 Windows cmd —
+        #   `echo '- 鸡蛋' >> todo.txt` 把中文写成了乱码 `'- ???? '`，文件当场被它弄坏。
+        #   write_file / edit_file 走引擎自己的实现，不受代码页影响；
+        #   少给一个「能在这台电脑上跑任意命令」的口子，也就少一档风险。
+        $list = if ($AllowWrite) {
+            "read_file,file_glob_search,grep_search,get_info,write_file,edit_file"
+        } else {
+            "read_file,file_glob_search,grep_search,get_info"
+        }
         $a += @("--tools", $list)
     }
     return $a
 }
 
 $llamaArgs = Build-Args
+if ($env:USB_AI_DUMP_ARGS) {
+    Write-Host "[DUMP] tplFile=[$tplFile]  sysPrompt.len=$($sysPrompt.Length)  toolsOn=$toolsOn"
+    Write-Host "[DUMP] $($llamaArgs -join ' ')"
+}
 # 引擎默认没设钥匙时会自己打一行警告："no API key is set and CORS allows all origins"。
 # 只在本机跑时无所谓；一旦 -Lan 开了局域网，同一个 wifi 下谁都能用 —— 加不加钥匙由人决定。
 if ($Lan -and $ApiKey) {
@@ -922,9 +1152,19 @@ if ($Lan -and $ApiKey) {
 
 Write-Host ""
 Write-Host "  上下文   :  $Ctx tokens" -ForegroundColor DarkGray
+# 32K 看着大，中文一轮问答就是几百到上千 token，聊二三十轮就满了。
+# 满了以后引擎静默丢掉最早的对话 —— 用户的感觉是"它开始记不住刚才说的了"。
+# 提前说一句，比让他在第 40 轮自己发现好。
+$rounds = [math]::Floor($Ctx / 1100)
+if ($rounds -ge 3) {
+    Write-Host "              大约能聊 $([math]::Floor($rounds*0.8))~$rounds 轮，之后会开始忘掉最早的对话" -ForegroundColor DarkGray
+}
 Write-Host "  显存卸载 :  $Ngl 层  (KV 缓存 $kvType)" -ForegroundColor DarkGray
 Write-Host "  CPU 线程 :  $threads" -ForegroundColor DarkGray
 Write-Host "  端口     :  $Port$(if ($portFrom) { "   （来源：$portFrom）" })" -ForegroundColor DarkGray
+Write-Host "  采样     :  temp $(Inv $sample.temp) / top_p $(Inv $sample.top_p) / top_k $([int]$sample.top_k) / min_p $(Inv $sample.min_p)" -ForegroundColor DarkGray
+$rp = if ($sample.repeat_penalty -eq 1.0) { "关" } else { Inv $sample.repeat_penalty }
+Write-Host "              重复惩罚 $rp ; 单条最长 $(if ([int]$sample.n_predict -eq -1) { '不限' } else { "$([int]$sample.n_predict) token" })" -ForegroundColor DarkGray
 if ($LoadMode -ne "auto") {
     Write-Host "  加载方式 :  $LoadMode" -ForegroundColor DarkGray
 }
@@ -946,7 +1186,7 @@ if ($tplFile -and $sysPrompt) {
     Write-Host "  系统提示 :  关   (-NoSystemPrompt)" -ForegroundColor DarkGray
 }
 if ($toolsOn) {
-    $scope = if ($AllowWrite) { "读 + 写 + 执行命令" } else { "只读" }
+    $scope = if ($AllowWrite) { "读 + 写（不含执行命令）" } else { "只读" }
     Write-Host "  读文件   :  开   ($scope)   ->   $toolDir" -ForegroundColor Green
     Write-Host "              AI 只能看见这个目录里的东西；把要问的文件放进去" -ForegroundColor DarkGray
     if ($Lan) {
@@ -999,6 +1239,18 @@ function Write-Settings {
             "端口     :  $Port$(if ($portFrom) { "   （来源：$portFrom）" })",
             "网页界面 :  http://127.0.0.1:$Port"
         )
+        $sampleSrc = @()
+        foreach ($k in $sampleFrom.Keys) { $sampleSrc += "$k=$($sampleFrom[$k])" }
+        $lines += ""
+        $lines += "采样参数 :  temp $(Inv $sample.temp) / top_p $(Inv $sample.top_p) / top_k $([int]$sample.top_k) / min_p $(Inv $sample.min_p)"
+        $lines += "            重复惩罚 $(Inv $sample.repeat_penalty)   单条最长 $(if ([int]$sample.n_predict -eq -1) { '不限' } else { "$([int]$sample.n_predict) token" })"
+        if ($sampleSrc.Count -gt 0) {
+            $lines += "            改动来源： $($sampleSrc -join ' ; ')"
+        } else {
+            $lines += "            全是内置默认值"
+        }
+        $lines += "            想改：直接编辑 $ParamFile，或命令行加 -Temp / -TopP / -RepeatPenalty 等。"
+        $lines += "            可用键： $($ParamDefaults.Keys -join ', ')"
         if ($Lan -and $lanIP) {
             $lines += "局域网   :  开   ->   http://${lanIP}:$Port"
         } else {
@@ -1024,7 +1276,7 @@ function Write-Settings {
             $lines += "系统提示 :  关   （没找到匹配这个模型的模板，见 templates\）"
         }
         if ($toolsOn) {
-            $scope = if ($AllowWrite) { "读 + 写 + 执行命令（-AllowWrite）" } else { "只读" }
+            $scope = if ($AllowWrite) { "读 + 写（不含执行命令）（-AllowWrite）" } else { "只读" }
             $lines += ""
             $lines += "读文件   :  开   （$scope）"
             $lines += "            AI 只能看见这个目录里的东西： $toolDir"
@@ -1042,6 +1294,65 @@ function Write-Settings {
     }
 }
 Write-Settings
+
+# ---------------- 6.6 有没有新版本 ----------------
+# 这支 U 盘一旦送出去，作者更新了什么，用的人永远不知道 —— 没有任何别的通道。
+# 查一次几十毫秒；没网就静默跳过，绝不因为连不上而拦住启动或者弹窗。
+# 只查「最新版 tag 是多少」，不上传任何东西，也不带任何本机信息。
+$RepoSlug   = "KAYOYAK/portable-ai-usb"
+function Compare-Ver([string]$a, [string]$b) {
+    # 返回 1 = a 比 b 新，0 = 一样，-1 = a 旧
+    $pa = @($a.TrimStart('v').Split('.') | ForEach-Object { $n = 0; if ([int]::TryParse($_, [ref]$n)) { $n } else { 0 } })
+    $pb = @($b.TrimStart('v').Split('.') | ForEach-Object { $n = 0; if ([int]::TryParse($_, [ref]$n)) { $n } else { 0 } })
+    for ($i = 0; $i -lt [math]::Max($pa.Count, $pb.Count); $i++) {
+        $x = if ($i -lt $pa.Count) { $pa[$i] } else { 0 }
+        $y = if ($i -lt $pb.Count) { $pb[$i] } else { 0 }
+        if ($x -gt $y) { return 1 }
+        if ($x -lt $y) { return -1 }
+    }
+    return 0
+}
+function Test-Update([switch]$Quiet) {
+    $latest = $null
+    try {
+        $r = Invoke-RestMethod "https://api.github.com/repos/$RepoSlug/releases/latest" `
+             -Headers @{ 'User-Agent' = "portable-ai-usb/$AppVersion" } -TimeoutSec 8 -ErrorAction Stop
+        $latest = [string]$r.tag_name
+    } catch {
+        # 没网、被墙、GitHub 挂了 —— 都是"查不到"，不是错误
+        if (-not $Quiet) {
+            Write-Host ""
+            Write-Host "  查不到（这台机器现在连不上 github.com）。不影响使用。" -ForegroundColor DarkGray
+            Write-Host "  想手动看：https://github.com/$RepoSlug/releases" -ForegroundColor DarkGray
+        }
+        return $null
+    }
+    if (-not $latest) { return $null }
+    $cmp = Compare-Ver $latest $AppVersion
+    if ($cmp -le 0) {
+        if (-not $Quiet) {
+            Write-Host ""
+            Write-Host "  已是最新版（$AppVersion）。" -ForegroundColor Green
+        }
+        return $false
+    }
+    Write-Host ""
+    Write-Host ("=" * 64) -ForegroundColor Cyan
+    Write-Host "  有新版本：$latest   （你现在是 $AppVersion）" -ForegroundColor Cyan
+    Write-Host ("=" * 64) -ForegroundColor Cyan
+    Write-Host "  下载： https://github.com/$RepoSlug/releases/tag/$latest" -ForegroundColor Cyan
+    Write-Host "  解压覆盖到 U 盘根目录即可；models\ 和 llama.cpp\ 不用动。" -ForegroundColor DarkGray
+    Write-Host ""
+    return $true
+}
+
+if ($CheckUpdate) {
+    Head "检查更新"
+    Write-Host "  当前版本 :  $AppVersion"
+    Test-Update | Out-Null
+    Wait-Enter
+    exit 0
+}
 
 if ($Probe) {
     Head "探测完成（未启动引擎）"
@@ -1224,8 +1535,14 @@ while ($true) {
     # 模板加载失败 → 去掉「默认中文」再来一次。模板是按模型名匹配的，万一匹配上
     # 格式不对的一份，引擎在解析期就直接退出。这时宁可少一个功能，不能让 U 盘起不来。
     # 只试一次：去掉之后还起不来，就是别的原因，交给下面报错。
+    #
+    # 判据不能宽。早先写的是 'chat template'，可引擎**每次**正常启动都会打
+    #   "chat template supports preserving reasoning, it is enabled by default"
+    # 于是一旦首启因别的原因失败（比如 -chat-template-kwargs 被空格拆断），
+    # 这个修正会误判成"模板坏了"、把好好的默认提示永久摘掉 —— 而且是静默的，
+    # 只有启动横幅里多一行"已去掉默认系统提示"。现在只认真正的报错措辞。
     if ($tplFile -and -not $tplDropped -and
-        ($oomTail -match '(?i)chat template|jinja|failed to parse|template.*error')) {
+        ($oomTail -match '(?i)--chat-template-kwargs|(failed|error|invalid|unsupported|not supported|not valid).{0,40}chat template|chat template.{0,40}(failed|error|invalid|unsupported|not supported|not valid)')) {
         $tplDropped = $true
         $tplFile    = $null
         $sysPrompt  = ""
@@ -1310,6 +1627,8 @@ if ($ready) {
     }
     Write-Host ("=" * 64) -ForegroundColor Green
     if (-not $NoBrowser) { Start-Process $url }
+    # 有新版才吭声，没网/已最新都安静 —— 启动路径上不该多出两行噪音。
+    try { Test-Update -Quiet | Out-Null } catch { }
 } else {
     if ($proc -and -not $proc.HasExited) {
         Write-Host "  等了 5 分钟还没就绪，但引擎进程还活着、也没报错。" -ForegroundColor Yellow
@@ -1325,3 +1644,4 @@ Write-Host ""
 Write-Host "  保持本窗口开启 = AI 持续运行。关闭窗口或 Ctrl+C 即停止。" -ForegroundColor DarkGray
 try { Wait-Process -Id $proc.Id } catch { }
 Write-Host "  引擎已停止。"
+Show-WorkspaceDiff

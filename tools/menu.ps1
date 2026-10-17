@@ -88,10 +88,12 @@ function Show-Menu {
     Write-Host "    [13] 启动  -  关掉默认说中文  (让模型自己挑语言)"
     Write-Host "    [14] 启动  -  局域网模式  (手机、平板连同一个 wifi 也能用)"
     Write-Host "    [15] 启动  -  让 AI 读文件  (回答「这个文件里写了什么」)"
+    Write-Host "    [19] 启动  -  让 AI 改文件  (会自动留备份, 改完列改动)"
     Write-Host ""
-    Write-Host "    [16] 设置  (看当前配置 / 改默认中文提示 / 改端口)"
+    Write-Host "    [16] 设置  (看当前配置 / 改提示 / 改端口 / 调参数)"
     Write-Host "    [17] 生成硬件反馈报告  (跑不动时发给作者)"
     Write-Host "    [18] 模型管理  (看详情 / 换模型 / 删掉不用的)"
+    Write-Host "    [20] 检查有没有新版本"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -272,18 +274,21 @@ while ($true) {
                 $setFile = Join-Path $Root '当前设置.txt'
                 $spFile  = Join-Path $Root '系统提示.txt'
                 $ptFile  = Join-Path $Root '端口设置.txt'
+                $paFile  = Join-Path $Root '参数设置.txt'
 
                 Write-Host ""
                 Write-Host "  ============================================================"
                 Write-Host "    设置"
                 Write-Host "  ============================================================"
                 Write-Host ""
-                Write-Host "    [1]  看当前设置      (模型 / 上下文 / 系统提示 / 端口)"
+                Write-Host "    [1]  看当前设置      (模型 / 上下文 / 系统提示 / 端口 / 采样)"
                 Write-Host "    [2]  改默认中文提示   (改掉「它为什么自动说中文」那句话)"
                 Write-Host "    [3]  改端口"
+                Write-Host "    [6]  调参数          (温度 / 发散度 / 重复惩罚 / 回答长度)"
                 Write-Host ""
                 Write-Host "    [4]  改回内置的中文提示  (删掉自定义的那句)"
                 Write-Host "    [5]  改回默认端口 8080   (删掉自定义的端口)"
+                Write-Host "    [7]  全部参数改回默认   (删掉 参数设置.txt)"
                 Write-Host ""
                 Write-Host "    [0]  返回"
                 Write-Host ""
@@ -398,6 +403,104 @@ while ($true) {
                             Write-Host "  已删掉 端口设置.txt，改回默认端口 8080。" -ForegroundColor Green
                         } else {
                             Write-Host "  本来就没设过自定义端口，现在用的就是 8080。"
+                        }
+                        Write-Host ""
+                        Pause-Safe
+                    }
+                    "6" {
+                        Clear-Safe
+                        Write-Host ""
+                        Write-Host "  调参数" -ForegroundColor Yellow
+                        Write-Host ""
+                        Write-Host "  这些值以前是写死的。改了以后会存进 参数设置.txt，下次启动生效。"
+                        Write-Host ""
+                        Write-Host "  ------------------------------------------------------------"
+                        Write-Host "   键                范围          默认        管什么"
+                        Write-Host "  ------------------------------------------------------------"
+                        Write-Host "   temp              0 ~ 2         0.6         越低越稳，越高越发散"
+                        Write-Host "   top_p             0 ~ 1         0.95        候选词的取舍范围"
+                        Write-Host "   top_k             0 ~ 200       20          0 = 关掉"
+                        Write-Host "   min_p             0 ~ 1         0           冷水词过滤"
+                        Write-Host "   repeat_penalty   0.5 ~ 2       1.1         1.0 = 关掉；老重复就调高"
+                        Write-Host "   n_predict         -1 ~ 32768    -1          -1 = 不限；限死能防它啰嗦"
+                        Write-Host "  ------------------------------------------------------------"
+                        Write-Host ""
+                        Write-Host "  一次改一个键：先输键名，再输值。留空 = 不改。"
+                        Write-Host ""
+                        $key = Read-Choice "  键名（直接回车取消）"
+                        if ($null -eq $key -or -not $key.Trim()) { continue }
+                        $key = $key.Trim().ToLower()
+                        $known = @{
+                            temp = @(0.0, 2.0); top_p = @(0.0, 1.0); top_k = @(0, 200)
+                            min_p = @(0.0, 1.0); repeat_penalty = @(0.5, 2.0); n_predict = @(-1, 32768)
+                        }
+                        if (-not $known.ContainsKey($key)) {
+                            Write-Host ""
+                            Write-Host "  [错误] 不认识这个键：$key" -ForegroundColor Red
+                            Write-Host "         可用的：$($known.Keys -join ', ')" -ForegroundColor Red
+                            Write-Host ""
+                            Pause-Safe
+                            continue
+                        }
+                        $val = Read-Choice "  $key = "
+                        if ($null -eq $val -or -not $val.Trim()) { continue }
+                        $num = 0.0
+                        if (-not [double]::TryParse($val.Trim(), [System.Globalization.NumberStyles]::Float,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$num)) {
+                            Write-Host ""
+                            Write-Host "  [错误] 这不是数字：$val" -ForegroundColor Red
+                            Write-Host ""
+                            Pause-Safe
+                            continue
+                        }
+                        $lo = $known[$key][0]; $hi = $known[$key][1]
+                        if ($num -lt $lo -or $num -gt $hi) {
+                            Write-Host ""
+                            Write-Host "  [错误] 超出范围：$key 要在 $lo ~ $hi 之间" -ForegroundColor Red
+                            Write-Host ""
+                            Pause-Safe
+                            continue
+                        }
+                        # 读旧文件 -> 改这一行（或追加）-> 写回。保留用户自己设过的其它键。
+                        $map = [ordered]@{}
+                        if (Test-Path $paFile) {
+                            foreach ($raw in [IO.File]::ReadAllLines($paFile)) {
+                                $m = [regex]::Match($raw.Trim(), '^([A-Za-z_]+)\s*[=:＝：]\s*(.+)$')
+                                if ($m.Success) { $map[$m.Groups[1].Value.ToLower()] = $m.Groups[2].Value.Trim() }
+                            }
+                        }
+                        $map[$key] = $val.Trim()
+                        $out = @(
+                            '# U盘 AI 便携版 —— 采样参数',
+                            '# 改完重启生效。删掉某个键 = 该键回到内置默认。',
+                            '# 范围：temp 0~2 / top_p 0~1 / top_k 0~200 / min_p 0~1 /',
+                            '#       repeat_penalty 0.5~2（1.0=关） / n_predict -1~32768（-1=不限）',
+                            ''
+                        )
+                        foreach ($k in @('temp','top_p','top_k','min_p','repeat_penalty','n_predict')) {
+                            if ($map.Contains($k)) { $out += "$k = $($map[$k])" }
+                        }
+                        try {
+                            [IO.File]::WriteAllText($paFile, ($out -join "`n") + "`n", (New-Object Text.UTF8Encoding($true)))
+                            Write-Host ""
+                            Write-Host "  已保存：$key = $($val.Trim())，下次启动生效。" -ForegroundColor Green
+                            Write-Host "    $paFile"
+                        } catch {
+                            Write-Host ""
+                            Write-Host "  写不进去：$($_.Exception.Message)" -ForegroundColor Red
+                        }
+                        Write-Host ""
+                        Pause-Safe
+                    }
+                    "7" {
+                        Clear-Safe
+                        Write-Host ""
+                        if (Test-Path $paFile) {
+                            Remove-Item $paFile -Force -ErrorAction SilentlyContinue
+                            Write-Host "  已删掉 参数设置.txt，所有采样参数改回内置默认：" -ForegroundColor Green
+                            Write-Host "    temp 0.6 / top_p 0.95 / top_k 20 / min_p 0 / repeat_penalty 1.1 / n_predict 不限"
+                        } else {
+                            Write-Host "  本来就没改过参数，现在用的就是内置默认值。"
                         }
                         Write-Host ""
                         Pause-Safe
@@ -551,6 +654,36 @@ while ($true) {
                     default { }
                 }
             }
+        }
+        "19" {
+            # 让 AI 改文件。默认关闭 —— 这一档模型能写、能改、能执行命令，
+            # 等于把这台电脑交出去。菜单里给，但每次都要先看清这几行。
+            Clear-Safe
+            Write-Host ""
+            Write-Host "  让 AI 改文件（可写）：" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  这一档会多开三个能力：" -ForegroundColor Yellow
+            Write-Host "    写新文件 / 修改已有文件 / 执行命令"
+            Write-Host ""
+            Write-Host "  [边界] 只能动 workspace 里的东西。" -ForegroundColor DarkGray
+            Write-Host "  [备份] 每次启动前会把 workspace 原样备份一份，改完列出哪些被改。" -ForegroundColor DarkGray
+            Write-Host "  [注意] 能执行命令 = 它能在你电脑上跑程序。别让它读你不信的文件后乱操作。" -ForegroundColor Yellow
+            Write-Host ""
+            $ok = Read-Choice "  想清楚再继续。输入 YES 开启，直接回车取消"
+            if ($ok -ne 'YES') {
+                Write-Host ""
+                Write-Host "  已取消。"
+                Write-Host ""
+                Pause-Safe
+                continue
+            }
+            & $Launcher -AllowWrite
+        }
+        "20" {
+            # 检查更新：不是自动更新，只告诉用户"有新的了，去哪下"。
+            Clear-Safe
+            & $Launcher -CheckUpdate
+            Pause-Safe
         }
         "0" { exit 0 }
         "q" { exit 0 }

@@ -42,6 +42,15 @@ CUSTOM_PROMPT=""        # --system-prompt 传进来的自定义句子
 PORT_SET=0              # 命令行有没有显式给 --port；给了就不读 端口设置.txt
 LAN=0                   # --lan：让同一个 wifi 里的手机也能连
 API_KEY=""              # --api-key：局域网模式下给接口上把锁
+APP_VERSION="1.5.0"     # 只给 --check-update 比对用
+DO_CHECK_UPDATE=0
+READ_FILES=0            # --read-files：让模型能看目录里的文件（只读四件）
+ALLOW_WRITE=0           # --allow-write：再加上写文件 / 改文件
+TOOL_DIR=""             # --tool-dir：AI 能看见的目录（默认 <U盘>/workspace）
+TOOL_DIR_FROM=""
+# 采样参数：留空表示"没显式给"，按 参数设置.txt > 内置默认 的顺序定
+S_TEMP=""; S_TOP_P=""; S_TOP_K=""; S_MIN_P=""; S_REPEAT=""; S_NPRED=""
+PARAM_FROM="内置默认"
 
 # ---------------------------------------------------------------- 输出
 if [ -t 1 ]; then
@@ -171,6 +180,20 @@ while [ $# -gt 0 ]; do
                           ""|--*) err "--system-prompt 后面要跟一句话"; printf '\n'; show_help; exit 1 ;;
                       esac
                       CUSTOM_PROMPT="$1" ;;
+        --read-files)  READ_FILES=1 ;;
+        --allow-write) ALLOW_WRITE=1; READ_FILES=1 ;;
+        --tool-dir)    shift
+                       case "${1:-}" in
+                           ""|--*) err "--tool-dir 后面要跟一个目录"; printf '\n'; show_help; exit 1 ;;
+                       esac
+                       TOOL_DIR="$1" ;;
+        --temp)        shift; S_TEMP="${1:-}" ;;
+        --top-p)       shift; S_TOP_P="${1:-}" ;;
+        --top-k)       shift; S_TOP_K="${1:-}" ;;
+        --min-p)       shift; S_MIN_P="${1:-}" ;;
+        --repeat-penalty) shift; S_REPEAT="${1:-}" ;;
+        --n-predict)   shift; S_NPRED="${1:-}" ;;
+        --check-update) DO_CHECK_UPDATE=1 ;;
         -h|--help)    show_help; exit 0 ;;
         *)            err "不认识的选项：$1"; printf '\n'; show_help; exit 1 ;;
     esac
@@ -205,6 +228,25 @@ if [ -f "$ROOT/系统提示.txt" ]; then
 fi
 
 # ---------------------------------------------------------------- 平台
+# ---- --check-update：只问一句有没有新版，然后退出 ----
+if [ "$DO_CHECK_UPDATE" = 1 ]; then
+    REPO_SLUG="KAYOYAK/portable-ai-usb"
+    _latest="$(curl -fsSL -m 8 "https://api.github.com/repos/$REPO_SLUG/releases/latest" 2>/dev/null \
+               | sed -n "s/.*\"tag_name\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1)"
+    printf '\n'
+    printf '  当前版本 :  v%s\n' "$APP_VERSION"
+    if [ -z "$_latest" ]; then
+        warn "查不到（可能没联网）。手动去： https://github.com/$REPO_SLUG/releases"
+    elif [ "$_latest" = "v$APP_VERSION" ]; then
+        printf '  已经是最新的。\n'
+    else
+        printf '  最新版本 :  %s\n' "$_latest"
+        printf '  下载地址 :  https://github.com/%s/releases/tag/%s\n' "$REPO_SLUG" "$_latest"
+    fi
+    printf '\n'
+    exit 0
+fi
+
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
@@ -594,6 +636,61 @@ if [ "$USE_SYSTEM_PROMPT" = 1 ]; then
     fi
 fi
 
+# ---- 采样参数：参数设置.txt > 内置默认 ----
+# 和 Windows 侧同构；命令行 --temp 之类显式给了就不再被文件盖掉。
+PARAM_FILE="$ROOT/参数设置.txt"
+if [ -f "$PARAM_FILE" ]; then
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in ''|'#'*) continue ;; esac
+        # 全角冒号/等号在字节层会被拆坏：先统一成半角再切
+        _line="$(printf '%s' "$_line" | sed "s/：/:/g; s/＝/=/g")"
+        _k="$(printf '%s' "${_line%%[=:：]*}" | tr -d ' \t\r')"
+        _v="$(printf '%s' "${_line#*[=:：]}" | tr -d ' \t\r')"
+        [ -n "$_k" ] || continue
+        case "$_k" in
+            temp)           [ -z "$S_TEMP" ]   && S_TEMP="$_v" ;;
+            top_p)          [ -z "$S_TOP_P" ]  && S_TOP_P="$_v" ;;
+            top_k)          [ -z "$S_TOP_K" ]  && S_TOP_K="$_v" ;;
+            min_p)          [ -z "$S_MIN_P" ]  && S_MIN_P="$_v" ;;
+            repeat_penalty) [ -z "$S_REPEAT" ] && S_REPEAT="$_v" ;;
+            n_predict)      [ -z "$S_NPRED" ]  && S_NPRED="$_v" ;;
+        esac
+    done < "$PARAM_FILE"
+    PARAM_FROM="参数设置.txt"
+fi
+[ -n "$S_TEMP" ]   || S_TEMP="0.6"
+[ -n "$S_TOP_P" ]  || S_TOP_P="0.95"
+[ -n "$S_TOP_K" ]  || S_TOP_K="20"
+[ -n "$S_MIN_P" ]  || S_MIN_P="0"
+[ -n "$S_REPEAT" ] || S_REPEAT="1.1"
+[ -n "$S_NPRED" ]  || S_NPRED="-1"
+
+# ---- 让 AI 读文件 / 改文件 ----
+# 引擎内置工具，通过 --tools 打开；开启后引擎自己会把 CORS 限制到 localhost。
+TOOLS_ON=0
+TOOLS_LIST=""
+TOOL_NOTE=""
+if [ "$READ_FILES" = 1 ] || [ "$ALLOW_WRITE" = 1 ]; then
+    TOOLS_ON=1
+    if [ -z "$TOOL_DIR" ]; then TOOL_DIR="$ROOT/workspace"; TOOL_DIR_FROM="默认"
+    else                            TOOL_DIR_FROM="--tool-dir"
+    fi
+    mkdir -p "$TOOL_DIR" 2>/dev/null || true
+    # exec_shell_command 故意不给：Windows 上是 cmd，中文输出会变成问号，
+    # 而且"能执行命令"和"能改文件"是两件事，不该顺带一起给。
+    if [ "$ALLOW_WRITE" = 1 ]; then
+        TOOLS_LIST="read_file,file_glob_search,grep_search,get_info,write_file,edit_file"
+    else
+        TOOLS_LIST="read_file,file_glob_search,grep_search,get_info"
+    fi
+    if printf '%s' "$TOOL_DIR" | LC_ALL=C grep -q '[^ -~]'; then
+        TOOL_NOTE="目录名里有非 ASCII 字符，引擎列举文件时可能报错 —— 建议换成纯英文目录名。"
+    fi
+    if [ -n "$SYS_PROMPT" ]; then
+        SYS_PROMPT="$SYS_PROMPT文件都在当前目录，路径直接写文件名就行。这个系统是 $(uname -s)。改文件用 write_file 或 edit_file，不要用命令行改。"
+    fi
+fi
+
 # ---- 拼参数 ----
 set -- \
     -m "$MODEL" \
@@ -605,7 +702,8 @@ set -- \
     --threads "$THREADS" \
     --jinja \
     --reasoning-format deepseek \
-    --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
+    --temp "$S_TEMP" --top-p "$S_TOP_P" --top-k "$S_TOP_K" --min-p "$S_MIN_P" \
+    --repeat-penalty "$S_REPEAT" --n-predict "$S_NPRED"
 
 # 只有 vulkan/cuda 那两份引擎才有这两个开关；macOS 的 Metal 交给引擎自己定
 case "$ENGINE" in
@@ -642,6 +740,10 @@ if [ -n "$TPL_FILE" ] && [ -n "$SYS_PROMPT" ]; then
     set -- "$@" --chat-template-file "$TPL_FILE" --chat-template-kwargs "$KW"
 fi
 
+if [ "$TOOLS_ON" = 1 ]; then
+    set -- "$@" --tools "$TOOLS_LIST"
+fi
+
 # 引擎没设钥匙时会自己打一行 "no API key is set and CORS allows all origins"。
 # 只在本机跑无所谓；一旦开了局域网，同一个 wifi 下谁都能用。
 if [ "$LAN" = 1 ] && [ -n "$API_KEY" ]; then
@@ -671,6 +773,13 @@ elif [ "$USE_SYSTEM_PROMPT" = 0 ]; then
     printf '  系统提示 : 关   %s(--no-system-prompt)%s\n' "$C_DIM" "$C_OFF"
 fi
 [ -n "$TPL_NOTE" ] && printf '\n  %s[注意] %s%s\n' "$C_WARN" "$TPL_NOTE" "$C_OFF"
+if [ "$TOOLS_ON" = 1 ]; then
+    if [ "$ALLOW_WRITE" = 1 ]; then _scope="读 + 写（不含执行命令）"; else _scope="只读"; fi
+    printf '  读文件   :  开   %s(%s)%s   ->   %s\n' "$C_DIM" "$_scope" "$C_OFF" "$TOOL_DIR"
+    [ "$LAN" = 1 ] && printf '              %s[注意] 开了局域网又开了写权限，同一个 wifi 下别人也能让 AI 改文件%s\n' "$C_WARN" "$C_OFF"
+    [ -n "$TOOL_NOTE" ] && printf '\n  %s[注意] %s%s\n' "$C_WARN" "$TOOL_NOTE" "$C_OFF"
+fi
+printf '  采样     :  temp %s / top_p %s / top_k %s / min_p %s%s\n' "$S_TEMP" "$S_TOP_P" "$S_TOP_K" "$S_MIN_P" "$([ "$PARAM_FROM" = "参数设置.txt" ] && printf '   （来源：参数设置.txt）')"
 
 # ---- 当前设置.txt ----
 # 和 Windows 侧同名同格式：一份人能读的"这次按什么配置跑的"。
@@ -693,6 +802,12 @@ _write_settings() {
         printf '加载方式 :  %s\n' "$LOAD_MODE"
         printf '端口     :  %s%s\n' "$PORT" "$([ -n "$PORT_FROM" ] && printf '   （来源：%s）' "$PORT_FROM")"
         printf '网页界面 :  http://127.0.0.1:%s\n' "$PORT"
+        printf '采样参数 :  temp %s / top_p %s / top_k %s / min_p %s / repeat %s / n_predict %s   （来源：%s）\n' "$S_TEMP" "$S_TOP_P" "$S_TOP_K" "$S_MIN_P" "$S_REPEAT" "$S_NPRED" "$PARAM_FROM"
+        if [ "$TOOLS_ON" = 1 ]; then
+            printf '读文件   :  开   （AI 只能看到 %s）\n' "$TOOL_DIR"
+        else
+            printf '读文件   :  关\n'
+        fi
         if [ "$LAN" = 1 ]; then
             printf '局域网   :  开   ->   http://%s:%s\n' "$LAN_IP" "$PORT"
         else
@@ -862,6 +977,11 @@ if [ ! -x "$ENGINE" ]; then
     info "试一下： chmod +x \"$ENGINE\""
     info "如果改不动（盘是只读挂载的），重新挂载时带上 exec 选项再试。"
     exit 1
+fi
+
+# 引擎的工作目录 = AI 能看见的世界。参数里的路径都是绝对路径，先切过去不影响它们。
+if [ "$TOOLS_ON" = 1 ] && [ -d "$TOOL_DIR" ]; then
+    cd "$TOOL_DIR" || true
 fi
 
 exec "$ENGINE" "$@"
