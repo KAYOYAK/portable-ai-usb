@@ -190,6 +190,17 @@ $out.Add("(做过哪些操作、报的什么错、屏幕上的原话 —— 贴�
 $out.Add("")
 $out.Add("")
 $out.Add("报告生成时间 : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+# 版本号必须进报告：同一个现象在 1.6 和 1.7 上常常是两回事，作者拿到报告
+# 第一件事就是看这一行。只从 launcher.ps1 里读，不另存一份免得对不上。
+$reportVer = "读不到"
+try {
+    $ljp = Join-Path $Root 'launcher.ps1'
+    if (Test-Path $ljp) {
+        $vm = [regex]::Match([IO.File]::ReadAllText($ljp), '\$AppVersion\s*=\s*"([0-9][0-9.]*)"')
+        if ($vm.Success) { $reportVer = $vm.Groups[1].Value }
+    }
+} catch { }
+$out.Add("U盘 AI 版本  : $reportVer")
 
 $text = ($out -join "`r`n")
 

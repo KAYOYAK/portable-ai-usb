@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.7.0"
+$AppVersion = "1.8.0"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -946,6 +946,36 @@ if (Test-Path $ParamFile) {
     } catch {
         # 读不动就用默认值，不该拦住启动
     }
+}
+
+# 参数设置.txt 写错的行必须说出来。以前这些提示只append进 $sampleNote 就再没人看 ——
+# 用户把 tmeperature 拼错一个字母，引擎照常启动、照常聊天，只是用内置默认值跑，
+# 没有任何地方告诉他改的那行根本没生效。这类静默失败比报错难查得多：
+# 他只会觉得"调了参数怎么没变化"。
+if ($sampleNote.Count -gt 0) {
+    foreach ($n in $sampleNote) {
+        Write-Host "  [参数] $n" -ForegroundColor Yellow
+    }
+    Write-Host "         （改 $ParamFile 里的写法，或用菜单 [6] 重新调）" -ForegroundColor DarkGray
+}
+
+# 轮转旧日志。每次启动写一对 logs\server-<时间戳>.log / .log.out，谁也不删；
+# 实测一天重度测试就攒了 60 个。体积不是问题（0.38 MB），问题是回头看某一次
+# 崩溃时要在几十个时间戳里翻。只留最近 20 对。
+# 只按 server-*.log 这个命名下手：端口.txt / 速度.txt / 上次对话.txt 不是这个
+# 前缀，不会被牵连。清失败不该拦住启动。
+try {
+    $logDir = Join-Path $Root "logs"
+    if (Test-Path $logDir) {
+        $oldLogs = @(Get-ChildItem $logDir -Filter "server-*.log" -File -ErrorAction SilentlyContinue |
+                     Sort-Object LastWriteTime -Descending | Select-Object -Skip 20)
+        foreach ($f in $oldLogs) {
+            Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+            Remove-Item ($f.FullName + ".out") -Force -ErrorAction SilentlyContinue
+        }
+    }
+} catch {
+    # 清日志失败不是启动失败的原因
 }
 
 # 传给引擎的数字必须用不变文化格式。中文区域的小数点也是 "."，但别的区域未必，

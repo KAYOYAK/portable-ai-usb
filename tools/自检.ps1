@@ -29,6 +29,18 @@ function I($t) { Write-Host "         $t" -ForegroundColor DarkGray }
 Head "portable-ai-usb  ·  环境自检"
 Write-Host "  位置 : $Root"
 
+# 版本号只写在 launcher.ps1 一处，这里现读现显示，不从别处抄一份 ——
+# 抄一份的下场就是哪天改了版本、两边对不上，而没人发现。
+$AppVersion = "读不到"
+try {
+    $launcherPath = Join-Path $Root "launcher.ps1"
+    if (Test-Path $launcherPath) {
+        $mm = [regex]::Match([IO.File]::ReadAllText($launcherPath), '\$AppVersion\s*=\s*"([0-9][0-9.]*)"')
+        if ($mm.Success) { $AppVersion = $mm.Groups[1].Value }
+    }
+} catch { }
+Write-Host "  版本 : $AppVersion"
+
 # ---------------- 1. 文件完整性 ----------------
 Write-Host ""
 Write-Host "  ── 文件 ──" -ForegroundColor Yellow
@@ -230,4 +242,7 @@ if ($fail -eq 0) {
 } else {
     Write-Host "  有缺失项。跑 tools\准备U盘.ps1 可以补齐。" -ForegroundColor Yellow
 }
+Write-Host ""
+Write-Host "  你在这台机器上的完整状态就看这一份：上面的文件、硬件、启动器选型，加上版本 $AppVersion。" -ForegroundColor DarkGray
+Write-Host "  想知道有没有新版：回菜单按 [20]；想把这台机器的硬件情况发出来：按 [17]。" -ForegroundColor DarkGray
 Write-Host ""

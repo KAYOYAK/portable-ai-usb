@@ -42,7 +42,10 @@ CUSTOM_PROMPT=""        # --system-prompt 传进来的自定义句子
 PORT_SET=0              # 命令行有没有显式给 --port；给了就不读 端口设置.txt
 LAN=0                   # --lan：让同一个 wifi 里的手机也能连
 API_KEY=""              # --api-key：局域网模式下给接口上把锁
-APP_VERSION="1.7.0"     # 只给 --check-update 比对用
+# 版本号只在 launcher.ps1 里写一次，这里现读；读不到才退回字面量。
+# 踩坑记录二十七：两处版本号、改一处等于没改，v1.6.0 就是这么发出去的。
+APP_VERSION="$(sed -n 's/.*\$AppVersion *= *"\([0-9][0-9.]*\)".*/\1/p' "$ROOT/launcher.ps1" 2>/dev/null | head -n 1)"
+[ -z "$APP_VERSION" ] && APP_VERSION="1.8.0"
 DO_CHECK_UPDATE=0
 READ_FILES=0            # --read-files：让模型能看目录里的文件（只读四件）
 ALLOW_WRITE=0           # --allow-write：再加上写文件 / 改文件
@@ -816,6 +819,13 @@ fi
 
 printf '\n'
 printf '  %s上下文   : %s tokens%s\n' "$C_DIM" "$CTX" "$C_OFF"
+# 中文一轮问答就是几百到上千 token，聊二三十轮就满了。满了以后引擎静默丢掉
+# 最早的对话 —— 用户的感觉是"它开始记不住刚才说的了"。提前说一句，比让他
+# 在第 40 轮自己发现好。和 Windows 侧同一套算法，两边说的话不能不一样。
+_rounds=$((CTX / 1100))
+if [ "$_rounds" -ge 3 ]; then
+    printf '              %s大约能聊 %s~%s 轮，之后会开始忘掉最早的对话%s\n' "$C_DIM" "$((_rounds * 8 / 10))" "$_rounds" "$C_OFF"
+fi
 printf '  显存卸载 : %s 层\n' "$NGL"
 if [ -n "$KV_SHOWN" ]; then
     printf '  KV 缓存  : %s\n' "$KV_SHOWN"
@@ -996,6 +1006,24 @@ fi
 mkdir -p "$DIR_LOG" 2>/dev/null || true
 printf '%s\n' "$PORT" > "$PORT_FILE" 2>/dev/null || true
 
+# 轮转旧日志。每次启动写一对 server-<时间戳>.log / .log.out，谁也不删；
+# 实测一天重度测试就攒了 60 个文件。体积不是问题（0.38 MB），问题是回头看
+# 某一次崩溃时要在几十个时间戳里翻。只留最近 20 对，其余删掉。
+# 只按 server-*.log 这个命名下手：端口.txt / 速度.txt / 上次对话.txt 不是这个
+# 前缀，也不会被 -maxdepth 1 之外的东西牵连。
+_purge_logs() {
+    [ -d "$DIR_LOG" ] || return 0
+    _keep=20
+    # ls -1t 按修改时间新到旧。文件名里本来就有时间戳，但用户可能从别处拷进
+    # 旧文件，用 mtime 更贴近"最近真的跑过"。
+    _old="$(ls -1t "$DIR_LOG"/server-*.log 2>/dev/null | tail -n +$((_keep + 1)))" || return 0
+    [ -z "$_old" ] && return 0
+    printf '%s\n' "$_old" | while IFS= read -r _f; do
+        [ -n "$_f" ] && rm -f "$_f" "$_f.out" 2>/dev/null
+    done
+}
+_purge_logs 2>/dev/null || true
+
 # ---- 起 ----
 URL="http://127.0.0.1:$PORT"
 head_line "正在启动  ·  模型加载完就能用"
@@ -1038,6 +1066,23 @@ if [ "$OPEN_BROWSER" = 1 ] || [ "$NO_SPEED_TEST" = 0 ]; then
                             printf '单位说明：1 token 约等于 0.6~1 个汉字，或约 0.75 个英文单词。\n'
                             printf 'tools/反馈报告.ps1 会自动读这个文件，不用你手填。\n'
                         } > "$ROOT/logs/速度.txt" 2>/dev/null || true
+                    fi
+                fi
+                # 工具链自检。/tools 是一张独立的表：`--tools` 能打开不等于这张表
+                # 真能用。实测工作目录带中文时「列目录 / 搜索」返回 500，而启动本身
+                # 一声不响 —— 用户要等到真用的时候才发现。所以就在就绪这一秒敲一次。
+                if [ "$TOOLS_ON" = 1 ]; then
+                    _tj="$(curl -s --max-time 20 -H 'Content-Type: application/json' \
+                        -d '{"tool":"get_info","params":{}}' "$URL/tools" 2>/dev/null)"
+                    if [ -z "$_tj" ]; then
+                        printf '   %s工具链   : 没答上来（引擎在跑，但 /tools 没回应）%s\n' "$C_WARN" "$C_OFF"
+                    elif printf '%s' "$_tj" | grep -q '"error"'; then
+                        _te="$(printf '%s' "$_tj" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+                        printf '   %s工具链   : 坏了 —— %s%s\n' "$C_WARN" "${_te:-未知错误}" "$C_OFF"
+                        printf '   %s            读单个文件多半还能用；「列目录 / 搜索」会失败。%s\n' "$C_WARN" "$C_OFF"
+                        printf '   %s            把 --tool-dir 指到纯英文路径再启动。%s\n' "$C_WARN" "$C_OFF"
+                    else
+                        printf '   工具链   : get_info 可用\n'
                     fi
                 fi
                 if [ "$OPEN_BROWSER" = 1 ]; then

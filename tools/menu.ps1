@@ -22,6 +22,16 @@ $Root     = Split-Path -Parent $Here.TrimEnd('\')
 $Launcher = Join-Path $Root 'launcher.ps1'
 $SelfTest = Join-Path $Here '自检.ps1'
 
+# 版本号只在 launcher.ps1 里写一次，这里现读现显示。抄一份的下场是
+# 改了版本、标题还写着老号，而没人发现。
+$script:MenuVersion = "?"
+try {
+    if (Test-Path $Launcher) {
+        $vm = [regex]::Match([IO.File]::ReadAllText($Launcher), '\$AppVersion\s*=\s*"([0-9][0-9.]*)"')
+        if ($vm.Success) { $script:MenuVersion = $vm.Groups[1].Value }
+    }
+} catch { }
+
 function Clear-Safe {
     # 非交互场景（无控制台 / stdin 被重定向）下 Clear-Host 会抛异常
     try { Clear-Host } catch { }
@@ -68,7 +78,9 @@ function Show-Menu {
     Clear-Safe
     Write-Host ""
     Write-Host "  ============================================================"
-    Write-Host "    U盘 AI 便携版  -  高级选项"
+    # 版本号挂在标题上：这是用户每次都会看到的一屏，比藏在 [20] 的输出里
+    # 有用得多 —— 报问题时报的就是这一行。
+    Write-Host "    U盘 AI 便携版  -  高级选项        v$script:MenuVersion" -ForegroundColor Cyan
     Write-Host "  ============================================================"
     Write-Host ""
     Write-Host "    [1]  NVIDIA  -  32K 上下文   (最常用)"
@@ -78,23 +90,31 @@ function Show-Menu {
     Write-Host "    [4]  AMD / Intel 显卡  (Vulkan)"
     Write-Host "    [5]  纯 CPU 模式  (任何电脑都能跑, 速度慢)"
     Write-Host ""
+    # 启动变体单独成组。以前 [19] 插在 [15] 和 [16] 之间，照着念会跳 ——
+    # 编号是历史包袱（加功能只能往后排），能改的是把它们按用途摆成四块，
+    # 每块内部都递增，眼睛不用来回找。
+    Write-Host "    - - 启动 (换一种跑法) - - - - - - - - - - - - - - - -"
+    Write-Host "    [12] 不用 mmap  (慢盘卡顿时用, 占内存)"
+    Write-Host "    [13] 关掉默认说中文  (让模型自己挑语言)"
+    Write-Host "    [14] 局域网模式  (手机、平板连同一个 wifi 也能用)"
+    Write-Host "    [15] 让 AI 读文件  (回答「这个文件里写了什么」)"
+    Write-Host "    [19] 让 AI 改文件  (会自动留备份, 改完列改动)"
+    Write-Host ""
+    Write-Host "    - - 工具 - - - - - - - - - - - - - - - - - - - - - -"
     Write-Host "    [6]  仅检测硬件, 不启动"
     Write-Host "    [7]  停止本 U 盘的 AI"
     Write-Host "    [8]  打开 AI 网页界面"
-    Write-Host "    [9]  环境自检  (U盘文件是否齐全)"
+    Write-Host "    [9]  环境自检  (U盘文件是否齐全、版本对不对)"
     Write-Host "    [10] 选择使用哪个模型  (models\ 下有多个时)"
     Write-Host "    [11] 测一下这支 U 盘的速度  (看看要等多久)"
-    Write-Host "    [12] 启动  -  不用 mmap  (慢盘卡顿时用, 占内存)"
-    Write-Host "    [13] 启动  -  关掉默认说中文  (让模型自己挑语言)"
-    Write-Host "    [14] 启动  -  局域网模式  (手机、平板连同一个 wifi 也能用)"
-    Write-Host "    [15] 启动  -  让 AI 读文件  (回答「这个文件里写了什么」)"
-    Write-Host "    [19] 启动  -  让 AI 改文件  (会自动留备份, 改完列改动)"
     Write-Host ""
+    Write-Host "    - - 管理 - - - - - - - - - - - - - - - - - - - - - -"
     Write-Host "    [16] 设置  (看当前配置 / 改提示 / 改端口 / 调参数)"
     Write-Host "    [17] 生成硬件反馈报告  (跑不动时发给作者)"
     Write-Host "    [18] 模型管理  (看详情 / 换模型 / 删掉不用的)"
     Write-Host "    [20] 检查有没有新版本"
     Write-Host "    [21] 清理 workspace 的旧备份  (攒多了占空间)"
+    Write-Host "    [22] 打开上次对话  (logs\上次对话.txt)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -754,6 +774,46 @@ while ($true) {
                 Write-Host ""
                 Write-Host ("  已删除 {0} 次备份。" -f $okN) -ForegroundColor Green
                 Write-Host ""
+            }
+            Pause-Safe
+        }
+        "22" {
+            # 上次对话。launcher 每次启动都把上一轮的问答落到 logs\上次对话.txt，
+            # 但菜单里一直没有入口 —— 用户知道有这个东西，却不知道怎么打开。
+            Clear-Safe
+            Write-Host ""
+            Write-Host "  上次对话" -ForegroundColor Yellow
+            Write-Host ""
+            $chatLog = Join-Path $Root 'logs\上次对话.txt'
+            if (-not (Test-Path $chatLog)) {
+                Write-Host "  还没有。等你跟 AI 聊过一轮，下次启动时就会写出来。"
+                Write-Host ""
+                Write-Host "  它在哪：$chatLog" -ForegroundColor DarkGray
+                Write-Host ""
+                Pause-Safe
+                continue
+            }
+            $fi = Get-Item $chatLog
+            $lines = @(Get-Content $chatLog -Encoding UTF8 -ErrorAction SilentlyContinue)
+            Write-Host ("  文件 :  {0}" -f $fi.FullName)
+            Write-Host ("  时间 :  {0:yyyy-MM-dd HH:mm}" -f $fi.LastWriteTime)
+            Write-Host ("  大小 :  {0:N1} KB / {1} 行" -f ($fi.Length / 1KB), $lines.Count)
+            Write-Host ""
+            $tailN = [math]::Min(12, $lines.Count)
+            if ($tailN -gt 0) {
+                Write-Host "  —— 末尾 $tailN 行 ——" -ForegroundColor DarkGray
+                $lines[($lines.Count - $tailN)..($lines.Count - 1)] | ForEach-Object {
+                    $t = if ($_.Length -gt 100) { $_.Substring(0, 100) + '…' } else { $_ }
+                    Write-Host "    $t" -ForegroundColor DarkGray
+                }
+                Write-Host ""
+            }
+            Write-Host "  这个文件只能看，导不回聊天界面（界面里的对话在浏览器本地）。"
+            Write-Host ""
+            $yn = Read-Choice "  用记事本打开原文吗？(y / 回车跳过)"
+            if ($yn -eq 'y') {
+                try { Start-Process notepad.exe -ArgumentList "`"$($fi.FullName)`"" }
+                catch { Write-Host "  打不开记事本，路径在上面，自己复制一下。" -ForegroundColor Yellow }
             }
             Pause-Safe
         }
