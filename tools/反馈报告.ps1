@@ -181,9 +181,55 @@ if ($speedLine) {
     try { foreach ($sl in [IO.File]::ReadAllLines($speedFile)) { $out.Add("  " + $sl) } } catch { }
     $out.Add("")
 }
+# 「越来越慢」只能从历史里看出来：速度.txt 每次覆盖，只剩最后一次。作者拿到报告
+# 想知道是「这台机器一直慢」还是「换了模型之后才慢」，没有历史就断不了这个案。
+$histFile = Join-Path $Root "logs\速度历史.txt"
+if (Test-Path $histFile) {
+    $hist = @()
+    try { $hist = @([IO.File]::ReadAllLines($histFile) | Where-Object { $_ -and $_.Trim() -and -not $_.StartsWith('每次启动实测') }) } catch { }
+    if ($hist.Count -gt 0) {
+        $out.Add("----- 速度历史（最近 $([math]::Min(10, $hist.Count)) 次）-----")
+        foreach ($h in ($hist | Select-Object -Last 10)) { $out.Add("  " + $h) }
+        $out.Add("")
+    }
+}
 $out.Add("----- 启动器探测 -----")
 if ($probeText) { foreach ($l in ($probeText -split "`r?`n")) { $out.Add("  " + $l) } }
 else { $out.Add("  (没跑出结果)") }
+$out.Add("")
+# 引擎自己的日志尾巴。用户报「起不来」的时候，光有硬件信息判断不了 —— 真正的
+# 原因就写在 server-*.log 里（崩溃栈、缺 DLL、显存不够那几句原话）。让他自己
+# 去翻文件再手动贴进来，中间就会丢，所以直接把最近一次的尾巴截进报告。
+$logDir  = Join-Path $Root "logs"
+$logTail = @()
+if (Test-Path $logDir) {
+    # 用 -like 而不是 -Filter：-Filter "server-*.log" 在 Windows 上会连
+    # server-*.log.out 一起匹配（8.3 短名），两边文件名判据就不一致了。
+    $mainLog = @(Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like 'server-*.log' } |
+                 Sort-Object Name -Descending | Select-Object -First 1)
+    $pair = @()
+    if ($mainLog.Count -gt 0) {
+        if ($mainLog[0].Length -gt 0) { $pair += $mainLog[0] }
+        $plusOut = Join-Path $logDir ($mainLog[0].Name + ".out")
+        if ((Test-Path $plusOut) -and (Get-Item $plusOut).Length -gt 0) { $pair += (Get-Item $plusOut) }
+    }
+    foreach ($lf in $pair) {
+        $all = @()
+        try { $all = @([IO.File]::ReadAllLines($lf.FullName)) } catch { continue }
+        # 空行去掉：引擎喜欢一个字母一行地刷，尾巴里全是空行就白占了
+        $tail = @($all | Where-Object { $_.Trim() } | Select-Object -Last 20)
+        if ($tail.Count -eq 0) { continue }
+        if ($logTail.Count -gt 0) { $logTail += "" }
+        $logTail += "[$($lf.Name)  共 $($all.Count) 行，下面是最后 $($tail.Count) 行]"
+        foreach ($t in $tail) {
+            $logTail += "  " + $(if ($t.Length -gt 160) { $t.Substring(0, 160) + ' …' } else { $t })
+        }
+    }
+}
+$out.Add("----- 引擎日志（最近一次启动）-----")
+if ($logTail.Count -gt 0) { foreach ($l in $logTail) { $out.Add($l) } }
+else { $out.Add("  (logs\ 里还没有 server-*.log —— 可能引擎一次都没起来过)") }
 $out.Add("")
 $out.Add("----- 备注 -----")
 $out.Add("(做过哪些操作、报的什么错、屏幕上的原话 —— 贴得越全越好)")

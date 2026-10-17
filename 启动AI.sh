@@ -675,26 +675,74 @@ fi
 
 # ---- 采样参数：参数设置.txt > 内置默认 ----
 # 和 Windows 侧同构；命令行 --temp 之类显式给了就不再被文件盖掉。
+#
+# 写错的行必须说出来。以前这里遇到不认识的键就直接跳过、不认识的写法也跳过，
+# 引擎照常启动、照常聊天，只是拿内置默认值在跑 —— 用户把 temperature 拼错一个
+# 字母，看到的现象是「调了参数怎么没变化」，没有任何地方告诉他那行没生效。
+# 这类静默失败比报错难查得多，所以每一行读不进去都记进 PARAM_NOTES。
 PARAM_FILE="$ROOT/参数设置.txt"
+PARAM_NOTES=()
+_param_bad() { PARAM_NOTES+=("参数设置.txt 第 $1 行：$2"); }
+
+# 键 → "下界 上界"，和 launcher.ps1 的 $ParamRanges 保持同一张表
+_param_range() {
+    case "$1" in
+        temp)           echo "0 2" ;;
+        top_p)          echo "0 1" ;;
+        top_k)          echo "0 200" ;;
+        min_p)          echo "0 1" ;;
+        repeat_penalty) echo "0.5 2" ;;
+        n_predict)      echo "-1 32768" ;;
+        threads)        echo "0 256" ;;
+        *)              echo "" ;;
+    esac
+}
+
+_param_set() {   # $1=键 $2=值 $3=行号 $4=目标变量名（间接赋值）
+    if [ -z "$(_param_range "$1")" ]; then
+        _param_bad "$3" "键「$1」不认识，跳过（认识的：temp, top_p, top_k, min_p, repeat_penalty, n_predict, threads）"
+        return 1
+    fi
+    if ! printf '%s' "$2" | grep -qE '^-?[0-9]+([.][0-9]+)?$'; then
+        _param_bad "$3" "「$1 = $2」不是数字，跳过"
+        return 1
+    fi
+    _rng="$(_param_range "$1")"; _lo="${_rng% *}"; _hi="${_rng#* }"
+    if ! awk -v v="$2" -v lo="$_lo" -v hi="$_hi" 'BEGIN{ exit !(v+0 >= lo+0 && v+0 <= hi+0) }'; then
+        _param_bad "$3" "「$1 = $2」超出范围（$_lo ~ $_hi），跳过"
+        return 1
+    fi
+    eval "$4=\"\$2\""
+    return 0
+}
+
 if [ -f "$PARAM_FILE" ]; then
+    _ln=0
     while IFS= read -r _line || [ -n "$_line" ]; do
+        _ln=$((_ln + 1))
         case "$_line" in ''|'#'*) continue ;; esac
+        case "$_line" in *[=:：]*) ;; *) _param_bad "$_ln" "没有「=」，跳过：$_line"; continue ;; esac
         # 全角冒号/等号在字节层会被拆坏：先统一成半角再切
         _line="$(printf '%s' "$_line" | sed "s/：/:/g; s/＝/=/g")"
         _k="$(printf '%s' "${_line%%[=:：]*}" | tr -d ' \t\r')"
         _v="$(printf '%s' "${_line#*[=:：]}" | tr -d ' \t\r')"
-        [ -n "$_k" ] || continue
+        [ -n "$_k" ] || { _param_bad "$_ln" "等号左边是空的，跳过"; continue; }
         case "$_k" in
-            temp)           [ -z "$S_TEMP" ]   && S_TEMP="$_v" ;;
-            top_p)          [ -z "$S_TOP_P" ]  && S_TOP_P="$_v" ;;
-            top_k)          [ -z "$S_TOP_K" ]  && S_TOP_K="$_v" ;;
-            min_p)          [ -z "$S_MIN_P" ]  && S_MIN_P="$_v" ;;
-            repeat_penalty) [ -z "$S_REPEAT" ] && S_REPEAT="$_v" ;;
-            n_predict)      [ -z "$S_NPRED" ]  && S_NPRED="$_v" ;;
-            threads)        [ -z "$S_THREADS" ] && S_THREADS="$_v" ;;
+            temp)           [ -z "$S_TEMP" ]   && _param_set temp           "$_v" "$_ln" S_TEMP ;;
+            top_p)          [ -z "$S_TOP_P" ]  && _param_set top_p          "$_v" "$_ln" S_TOP_P ;;
+            top_k)          [ -z "$S_TOP_K" ]  && _param_set top_k          "$_v" "$_ln" S_TOP_K ;;
+            min_p)          [ -z "$S_MIN_P" ]  && _param_set min_p          "$_v" "$_ln" S_MIN_P ;;
+            repeat_penalty) [ -z "$S_REPEAT" ] && _param_set repeat_penalty "$_v" "$_ln" S_REPEAT ;;
+            n_predict)      [ -z "$S_NPRED" ]  && _param_set n_predict      "$_v" "$_ln" S_NPRED ;;
+            threads)        [ -z "$S_THREADS" ] && _param_set threads        "$_v" "$_ln" S_THREADS ;;
+            *)              _param_bad "$_ln" "键「$_k」不认识，跳过（认识的：temp, top_p, top_k, min_p, repeat_penalty, n_predict, threads）" ;;
         esac
     done < "$PARAM_FILE"
     PARAM_FROM="参数设置.txt"
+fi
+if [ "${#PARAM_NOTES[@]}" -gt 0 ]; then
+    for _n in "${PARAM_NOTES[@]}"; do printf '  [参数] %s\n' "$_n"; done
+    printf '         （改 %s 里的写法，或用菜单 [6] 重新调）\n' "$PARAM_FILE"
 fi
 [ -n "$S_TEMP" ]   || S_TEMP="0.6"
 [ -n "$S_TOP_P" ]  || S_TOP_P="0.95"
@@ -1103,12 +1151,33 @@ if [ "$OPEN_BROWSER" = 1 ] || [ "$NO_SPEED_TEST" = 0 ]; then
                         "$URL/v1/chat/completions" 2>/dev/null)"
                     _pps="$(printf '%s' "$_sj" | sed -n 's/.*"predicted_per_second"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p')"
                     _pq="$(printf '%s' "$_sj" | sed -n 's/.*"prompt_per_second"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p')"
+                    # 首字延迟：timings.prompt_ms 才是「你按下回车到第一个字出来」的时间。
+                    # 只报 token/秒 会漏掉最影响体感的那一段 —— 生成很快但首字要等 2 秒，
+                    # 用起来依然卡。Windows 侧 v1.7.0 起就有，这里对齐。
+                    _tms="$(printf '%s' "$_sj" | sed -n 's/.*"prompt_ms"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/p')"
+                    _ttft=""
+                    if [ -n "$_tms" ]; then
+                        _ttft="$(awk -v ms="$_tms" 'BEGIN{printf "%.2f", ms/1000}' 2>/dev/null)"
+                    fi
                     if [ -n "$_pps" ]; then
-                        printf '   实测速度: %s token/秒   （提示处理 %s；单位是 token，中文约 1 字 = 0.6~1 token）\n' "$_pps" "${_pq:-?}"
+                        # 两位都收成一位小数：速度历史.txt 要和 Windows 侧写得一样，
+                        # 不然同一份文件里两种格式，扫一眼看不出趋势。
+                        _pps1="$(awk -v v="$_pps" 'BEGIN{printf "%.1f", v}' 2>/dev/null)"
+                        _pq1="$(awk -v v="$_pq" 'BEGIN{printf "%.1f", v}' 2>/dev/null)"
+                        if [ -n "$_ttft" ]; then
+                            printf '   实测速度: %s token/秒，首字 %s 秒   （提示处理 %s；单位是 token，中文约 1 字 = 0.6~1 token）\n' \
+                                "${_pps1:-$_pps}" "$_ttft" "${_pq1:-${_pq:-?}}"
+                        else
+                            printf '   实测速度: %s token/秒   （提示处理 %s；单位是 token，中文约 1 字 = 0.6~1 token）\n' \
+                                "${_pps1:-$_pps}" "${_pq1:-${_pq:-?}}"
+                        fi
                         {
                             printf '本机实测速度（启动器自动生成，%s）\n\n' "$(date '+%Y-%m-%d %H:%M')"
-                            printf '生成速度 : %s token/秒\n' "$_pps"
-                            printf '提示处理 : %s token/秒\n' "${_pq:-未测到}"
+                            printf '生成速度 : %s token/秒\n' "${_pps1:-$_pps}"
+                            if [ -n "$_ttft" ]; then
+                                printf '首字延迟 : %s 秒   （引擎处理你这句话的时间；对话越长它越大）\n' "$_ttft"
+                            fi
+                            printf '提示处理 : %s token/秒\n' "${_pq1:-${_pq:-未测到}}"
                             printf '后端     : %s\n' "$BACKEND_FULL"
                             printf '上下文   : %s tokens，KV %s\n' "$CTX" "${KV_SHOWN:-默认}"
                             printf '线程     : %s\n\n' "$THREADS"
@@ -1120,8 +1189,9 @@ if [ "$OPEN_BROWSER" = 1 ] || [ "$NO_SPEED_TEST" = 0 ]; then
                         {
                             _hf="$ROOT/logs/速度历史.txt"
                             [ -f "$_hf" ] || printf '每次启动实测的速度（一行一次，只留最近 50 条；详情看 速度.txt）\n' > "$_hf"
-                            printf '%s  %s  %s tok/s  提示 %s tok/s  %s  ctx %s\n' \
-                                "$(date '+%Y-%m-%d %H:%M')" "$(basename "$MODEL")" "$_pps" "${_pq:-?}" "$BACKEND" "$CTX" >> "$_hf"
+                            printf '%s  %s  %s tok/s  首字 %ss  提示 %s tok/s  %s  ctx %s\n' \
+                                "$(date '+%Y-%m-%d %H:%M')" "$(basename "$MODEL")" "${_pps1:-$_pps}" \
+                                "${_ttft:-?}" "${_pq1:-${_pq:-?}}" "$BACKEND" "$CTX" >> "$_hf"
                             _hc="$(wc -l < "$_hf" 2>/dev/null || echo 0)"
                             if [ "$_hc" -gt 51 ] 2>/dev/null; then
                                 { head -n 1 "$_hf"; tail -n 50 "$_hf"; } > "$_hf.tmp" && mv -f "$_hf.tmp" "$_hf"

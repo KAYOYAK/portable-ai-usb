@@ -248,6 +248,36 @@ if ($ok -and $wantMmproj) {
 
 if (-not $ok) { Die "模型没下成功，磁盘上没留下完整文件。" }
 
+# ---------------- 写进校验清单 ----------------
+# 下载时验过一次哈希，但那个值只活在这次运行里。清单是 tools\自检.ps1 唯一的
+# 基准 —— 不写回去，用户换完模型跑自检只会看到「清单是旧的，重跑准备U盘.ps1」，
+# 等于为了补一行记录让人去跑组装整支 U 盘的脚本。
+$verified = New-Object System.Collections.ArrayList
+$shaMain = Get-FullSha $pick
+if (-not $shaMain) {
+    # 上游没给可信哈希，那就当场算一份基线。文件刚下完还在系统缓存里，几秒钟。
+    # 大小已经和上游对过账，所以这个基线只用来判断「以后有没有坏」，够用。
+    Info "这个模型上游没给哈希，正在本地算一份基线（文件还在缓存里，很快）..."
+    try {
+        $shaMain = (Get-FileHash -LiteralPath (Join-Path $dirModels $pickFile) -Algorithm SHA256).Hash.ToLower()
+    } catch { $shaMain = "" }
+}
+if ($shaMain) { [void]$verified.Add(@($pickFile, $shaMain)) }
+if ($wantMmproj) {
+    $projPath = Join-Path $dirModels $Mmproj.File
+    if ((Test-Path -LiteralPath $projPath) -and $Mmproj.Sha -and $Mmproj.Sha.Length -eq 64) {
+        [void]$verified.Add(@($Mmproj.File, $Mmproj.Sha.ToLower()))
+    }
+}
+$wrote = 0
+foreach ($v in $verified) {
+    $p = Join-Path $dirModels $v[0]
+    if (Test-Path -LiteralPath $p) {
+        if (Update-ModelManifest $dirModels $v[0] $v[1] (Get-Item -LiteralPath $p).Length) { $wrote++ }
+    }
+}
+if ($wrote -gt 0) { OK "已写进 models\校验.txt（自检时按这个复查）" }
+
 # ---------------- 设成默认 ----------------
 Step 3 "设为默认模型"
 $setIt = if ($Yes) { $true } else { Ask-Yes "以后启动就用这个模型吗？" $true }

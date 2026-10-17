@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.9.0"
+$AppVersion = "1.10.0"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -1197,9 +1197,20 @@ function Save-LastChat {
         $chatDir = Join-Path $Root "logs\对话"
         try { New-Item -ItemType Directory -Path $chatDir -Force -ErrorAction Stop | Out-Null } catch { }
         $out = Join-Path $chatDir "$stamp.txt"
+        # 存档里要带上「当时是哪套配置」。三十份记录攒下来之后，「这个问题当时
+        # 是哪个模型答的、跑在哪个后端上」决定了这份记录还有没有参考价值 ——
+        # 只写时间，等于三条记录长得一模一样却分不清。
+        $cfgBits = @()
+        if ($model)   { $cfgBits += "模型 $($model.Name)" }
+        if ($backend) { $cfgBits += "后端 $backend" }
+        if ($Ctx)     { $cfgBits += "上下文 $Ctx" }
+        if ($threads) { $cfgBits += "线程 $threads" }
+        if ($kvType)  { $cfgBits += "KV $kvType" }
+        $cfgLine = if ($cfgBits.Count) { "那次的配置：" + ($cfgBits -join "  |  ") } else { "" }
         $head = (@(
             "这次运行时聊的内容（从引擎的 prompt 记录还原）"
             "记录时间：$($newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))"
+            $(if ($cfgLine) { $cfgLine } else { "那次的配置：（没记到）" })
             ""
             "两点说明："
             "  1. 引擎是「发送前」记的，所以最后一句 AI 回答不在里面。"

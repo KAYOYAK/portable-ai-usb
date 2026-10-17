@@ -340,7 +340,7 @@ if (Test-Path $manifest) {
         }
     }
 }
-$mOut = @("# 模型校验清单 —— 由 tools\准备U盘.ps1 生成，tools\自检.ps1 用它复查文件有没有坏。",
+$mOut = @("# 模型校验清单 —— 由 tools\准备U盘.ps1 / tools\换模型.ps1 生成，tools\自检.ps1 用它复查文件有没有坏。",
           "# 格式：<sha256>  <字节数>  <文件名>",
           "")
 $mCount = 0

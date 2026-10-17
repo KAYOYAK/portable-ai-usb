@@ -95,7 +95,7 @@ if ($mmprojFiles.Count -gt 0) {
 $manifest = Join-Path $dirModels "校验.txt"
 if ($models.Count -gt 0) {
     if (-not (Test-Path $manifest)) {
-        W "没有 models\校验.txt —— 没法确认模型文件是否完好（跑一次 tools\准备U盘.ps1 会生成）"
+        W "没有 models\校验.txt —— 没法确认模型文件是否完好（tools\准备U盘.ps1 或 tools\换模型.ps1 会生成）"
     } else {
         $known = @{}
         foreach ($ln in @(Get-Content $manifest -Encoding UTF8 -ErrorAction SilentlyContinue)) {
@@ -103,10 +103,19 @@ if ($models.Count -gt 0) {
                 $known[$Matches[3]] = @{ Hash = $Matches[1].ToLower(); Size = [long]$Matches[2] }
             }
         }
+        # 清单什么时候写的，直接决定它有多可信：刚换过模型却看到「三个月前更新」，
+        # 说明手上这份不是最新的。不说出来，用户只会盯着下面那句「不在清单里」发愣。
+        $mAge = (Get-Date) - (Get-Item $manifest).LastWriteTime
+        $ageTxt = if ($mAge.TotalMinutes -lt 60) { "不到一小时前" }
+                  elseif ($mAge.TotalHours -lt 48) { "{0:N0} 小时前" -f $mAge.TotalHours }
+                  else { "{0:N0} 天前" -f $mAge.TotalDays }
+        # 变量名后面紧跟中文必须写 ${...} —— PowerShell 把中文当变量名的合法字符，
+        # "$ageTxt更新" 会被读成变量 ageTxt更新（不存在 → 空），不报错，只是那句话空了。
+        I "校验清单 : ${ageTxt}更新，记了 $($known.Count) 个模型"
         foreach ($m in $models) {
             $k = $known[$m.Name]
             if (-not $k) {
-                W "$($m.Name) 不在校验清单里 —— 清单是旧的，重跑 tools\准备U盘.ps1 可以补上"
+                W "$($m.Name) 不在校验清单里 —— 清单是旧的，跑 tools\准备U盘.ps1 或 tools\换模型.ps1 可以补上"
                 continue
             }
             if ($k.Size -ne $m.Length) {

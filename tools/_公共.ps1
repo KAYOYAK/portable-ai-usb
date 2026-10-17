@@ -142,3 +142,38 @@ function Get-RemoteSize($Url) {
     } catch { }
     return 0
 }
+
+# 往 models\校验.txt 里写一条记录，其余行原样保留（同名的替换）。
+#
+# 为什么需要：下载时验过一次哈希，但那个值只活在这次运行里。清单是 tools\自检.ps1
+# 唯一的基准 —— 不写回去，用户换完模型跑自检就只会看到「清单是旧的，重跑
+# tools\准备U盘.ps1 可以补上」，等于为了补一行记录让人去跑组装整支 U 盘的脚本。
+function Update-ModelManifest($ModelsDir, [string]$Name, [string]$Hash, [long]$Size) {
+    $manifest = Join-Path $ModelsDir "校验.txt"
+    $keep = [ordered]@{}
+    if (Test-Path -LiteralPath $manifest) {
+        foreach ($ln in @(Get-Content -LiteralPath $manifest -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            # 格式：<64位十六进制>  <字节数>  <文件名>
+            if ($ln -match '^\s*([0-9a-fA-F]{64})\s+(\d+)\s+(.+?)\s*$') {
+                $nm = $Matches[3]
+                if ($nm -ne $Name) {
+                    $keep[$nm] = ("{0}  {1}  {2}" -f $Matches[1].ToLower(), [long]$Matches[2], $nm)
+                }
+            }
+        }
+    }
+    $keep[$Name] = ("{0}  {1}  {2}" -f $Hash.ToLower(), $Size, $Name)
+    $out = @("# 模型校验清单 —— 由 tools\准备U盘.ps1 / tools\换模型.ps1 生成，tools\自检.ps1 用它复查文件有没有坏。",
+             "# 格式：<sha256>  <字节数>  <文件名>",
+             "")
+    foreach ($nm in ($keep.Keys | Sort-Object)) { $out += $keep[$nm] }
+    try {
+        [IO.File]::WriteAllText($manifest, ($out -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+        return $true
+    } catch {
+        # 写不进去不致命（U 盘只读、权限不足），但要说出来 —— 否则用户下次自检
+        # 看到「清单是旧的」会以为是自己操作错了。
+        Warn "校验清单写不进去（$($_.Exception.Message)）。下次自检会提示清单是旧的。"
+        return $false
+    }
+}
