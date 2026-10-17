@@ -50,6 +50,32 @@ foreach ($f in $need) {
     if (Test-Path (Join-Path $Root $f)) { P $f } else { F $f }
 }
 
+# .bat 的行尾必须是 CRLF。从 GitHub 下 ZIP 解出来、或者用某些编辑器保存一次，
+# 就会变成裸 LF —— cmd 读 bat 时遇到裸 LF 会跑飞，用户看到的是「双击闪一下就没了」，
+# 而自检原来只查文件在不在，会说一切正常。踩坑记录里记过一次。
+$batBad = @()
+foreach ($b in @("启动AI.bat", "高级选项.bat")) {
+    $bp = Join-Path $Root $b
+    if (-not (Test-Path $bp)) { continue }
+    try {
+        $bs = [IO.File]::ReadAllBytes($bp)
+        $bareLf = 0
+        for ($i = 0; $i -lt $bs.Length; $i++) {
+            if ($bs[$i] -eq 10 -and ($i -eq 0 -or $bs[$i - 1] -ne 13)) { $bareLf++ }
+        }
+        if ($bareLf -gt 0) { $batBad += "$b（$bareLf 处裸 LF）" }
+    } catch {
+        $batBad += "$b（读不出来：$($_.Exception.Message)）"
+    }
+}
+if ($batBad.Count -gt 0) {
+    F "批处理文件的行尾坏了： $($batBad -join '；')"
+    I "双击它只会闪一下就没了。把这几份从发布包里重新解压覆盖，"
+    I "或者用记事本打开、另存为（ANSI 或 UTF-8 都行，关键是行尾）。"
+} else {
+    P "两个 .bat 的行尾（CRLF）"
+}
+
 # 模型
 $dirModels = Join-Path $Root "models"
 $models = @()

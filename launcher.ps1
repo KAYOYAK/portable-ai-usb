@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.10.0"
+$AppVersion = "1.11.0"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -1135,6 +1135,35 @@ function Show-WorkspaceDiff {
         Write-Host "  AI 没有改动 workspace\ 里的任何文件。" -ForegroundColor DarkGray
         return
     }
+    # 屏幕上这份是一次性的，滚过去就没了。落一份到 logs\改动\，事后能对账 ——
+    # 尤其配上 .backup\ 里那次备份：以前备份目录名只有时间戳，事后根本对不上
+    # 哪次对应哪个改动，现在两边都记着时间，能对上号。
+    $diffSaved = $null
+    try {
+        $diffDir = Join-Path $Root "logs\改动"
+        New-Item -ItemType Directory -Path $diffDir -Force -ErrorAction Stop | Out-Null
+        $dStamp = (Get-Date).ToString('yyyy-MM-dd-HHmmss')
+        $dl = @(
+            "AI 动过的文件（启动器自动生成）"
+            ""
+            ("记录时间 : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+            ("模型     : {0}" -f $(if ($model -and $model.Name) { $model.Name } else { '未知' }))
+            ("工作目录 : $toolDir")
+            ("备份位置 : {0}" -f $(if ($snapDir) { $snapDir } else { '这次没做备份，退不回去' }))
+            ""
+        )
+        foreach ($x in $new)  { $dl += "新写  $x" }
+        foreach ($x in $edit) { $dl += "改动  $x" }
+        foreach ($x in $gone) { $dl += "删除  $x" }
+        $dl += ""
+        $dl += ("合计：新写 {0} / 改动 {1} / 删除 {2}" -f $new.Count, $edit.Count, $gone.Count)
+        [IO.File]::WriteAllText((Join-Path $diffDir "$dStamp.txt"), (($dl -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+        $diffSaved = "logs\改动\$dStamp.txt"
+        # 和对话存档一样只留最近 50 份，免得越攒越多。
+        $oldD = @(Get-ChildItem $diffDir -Filter "*.txt" -File -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -Skip 50)
+        foreach ($o in $oldD) { try { Remove-Item $o.FullName -Force -ErrorAction Stop } catch { } }
+    } catch { }
     Write-Host ""
     Write-Host ("=" * 64) -ForegroundColor Yellow
     Write-Host "  AI 动过的文件" -ForegroundColor Yellow
@@ -1149,6 +1178,9 @@ function Show-WorkspaceDiff {
     } else {
         Write-Host ""
         Write-Host "  这次没做备份（-NoSnapshot 或备份目录建不出来），只能看见改动、退不回去。" -ForegroundColor Yellow
+    }
+    if ($diffSaved) {
+        Write-Host "  这份清单也存了一份： $diffSaved" -ForegroundColor DarkGray
     }
     Write-Host ""
 }
@@ -1478,6 +1510,13 @@ function Write-Settings {
             $lines += "启动时自动降过档："
             foreach ($n in $retryNote) { $lines += "  - $n" }
         }
+        # 引擎起不来的第一嫌疑就是参数（invalid literal / unrecognized argument），
+        # 而拼好的命令行以前从来不留痕 —— 用户报「起不来」时没法复现。原样记一份，
+        # tools\反馈报告.ps1 也读这一段。
+        $lines += ""
+        $lines += "引擎命令行 :"
+        $lines += ("  程序 : {0}" -f $(if ($exe) { $exe } else { '（还没定）' }))
+        $lines += ("  参数 : {0}" -f $(if ($llamaArgs) { ($llamaArgs -join ' ') } else { '（还没拼）' }))
         [IO.File]::WriteAllText($settingsPath, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding($true)))
     } catch {
         # 写不进去（写保护的盘）不该拦住启动，静默跳过
@@ -1881,6 +1920,20 @@ if ($ready) {
         } catch { }
     }
 
+    # 存档 / 备份 / 日志都要写盘，而它们写失败的地方全是静默 try/catch。盘满了以后
+    # 用户看到的只有收摊时那句「这次没做备份」—— 那时事情已经发生过了。提前说一声。
+    try {
+        $di = New-Object IO.DriveInfo([IO.Path]::GetPathRoot($Root))
+        if ($di.IsReady) {
+            $freeMB = [math]::Round($di.AvailableFreeSpace / 1MB, 0)
+            if ($freeMB -lt 500) {
+                Write-Host ("   磁盘剩余 :  只剩 {0:N0} MB（{1}）" -f $freeMB, $di.Name) -ForegroundColor Yellow
+                Write-Host "               U 盘快满了，备份和聊天存档可能悄悄写不进去。" -ForegroundColor Yellow
+                Write-Host "               清一清：菜单 [21] 删旧备份；logs\对话\ 和 logs\改动\ 也是可删的。" -ForegroundColor Yellow
+            }
+        }
+    } catch { }
+
     # 引擎每次回答都会返回 timings，直接就有每秒 token 数 —— 不用开 --metrics。
     # 之前 tools\反馈报告.ps1 让用户手填"生成速度"，那是把我们自己能量的东西外包给用户。
     # 顺带把模型预热了：第一条真问题会比冷启动时快。
@@ -1931,6 +1984,20 @@ if ($ready) {
                     $histFile = Join-Path $Root "logs\速度历史.txt"
                     $histLine = ("{0}  {1}  {2:N1} tok/s  首字 {3:N2}s  提示 {4:N1} tok/s  {5}  ctx {6}" -f `
                         (Get-Date -Format 'yyyy-MM-dd HH:mm'), $model.Name, $tps, ($ttft / 1000), $pps, $backend, $Ctx)
+                    # 先看上一次是多少再追加 —— 单看一个数没意义。掉两成通常是换了支
+                    # 盘、后台抢了显存、或者这次有层没进显存（模型大小/参数变了）。
+                    $prevTps = 0
+                    if (Test-Path $histFile) {
+                        $prevLines = @(Get-Content $histFile -Encoding utf8 -ErrorAction SilentlyContinue |
+                                       Where-Object { $_ -match ' tok/s' })
+                        if ($prevLines.Count -gt 0) {
+                            $pm = [regex]::Match($prevLines[-1], '([0-9]+(?:[.,][0-9]+)?) tok/s')
+                            if ($pm.Success) {
+                                $raw = $pm.Groups[1].Value -replace ',', '.'
+                                try { $prevTps = [double]::Parse($raw, [Globalization.CultureInfo]::InvariantCulture) } catch { }
+                            }
+                        }
+                    }
                     if (-not (Test-Path $histFile)) {
                         [IO.File]::WriteAllText($histFile,
                             "每次启动实测的速度（一行一次，只留最近 50 条；详情看 速度.txt）`r`n",
@@ -1942,6 +2009,15 @@ if ($ready) {
                     if ($hl.Count -gt 51) {
                         $keep = @($hl[0]) + @($hl[($hl.Count - 50)..($hl.Count - 1)])
                         [IO.File]::WriteAllText($histFile, ($keep -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+                    }
+                    if ($prevTps -gt 0) {
+                        $ratio = $tps / $prevTps
+                        if ($ratio -lt 0.8) {
+                            Write-Host ("   上次是 {0:N1} token/秒，这次慢了 {1:N0}%。" -f $prevTps, ((1 - $ratio) * 100)) -ForegroundColor Yellow
+                            Write-Host "     常见原因：换了支 U 盘 / 后台有程序抢显存 / 模型层数或上下文改过。" -ForegroundColor Yellow
+                        } elseif ($ratio -gt 1.25) {
+                            Write-Host ("   上次是 {0:N1} token/秒，这次快了 {1:N0}%。" -f $prevTps, (($ratio - 1) * 100)) -ForegroundColor Green
+                        }
                     }
                 } catch { }
             } catch { }

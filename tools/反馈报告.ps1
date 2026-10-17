@@ -30,6 +30,27 @@ if (-not $Root) {
 if (-not $Root) { $Root = (Get-Location).Path }
 $Root = $Root.TrimEnd('\')
 
+# 下面第 4 段的「启动器探测」会用 -Probe 再跑一次 launcher，而那次运行会整份重写
+# 当前设置.txt —— 写进去的是「只探测、没启动」的配置：没有 -AllowWrite 带来的工具
+# 清单，系统提示也是内置那句而不是盘上的。所以真正的引擎命令行必须在那之前就抄下来，
+# 探针跑完再把文件还原回去，否则用户打开 当前设置.txt 看到的是个假配置。
+$setFileTxt  = Join-Path $Root "当前设置.txt"
+$setSnapshot = $null
+$cmdLines    = @()
+if (Test-Path $setFileTxt) {
+    try { $setSnapshot = [IO.File]::ReadAllBytes($setFileTxt) } catch { }
+    $allSet = @()
+    try { $allSet = @([IO.File]::ReadAllLines($setFileTxt)) } catch { }
+    for ($si = 0; $si -lt $allSet.Count; $si++) {
+        if ($allSet[$si] -match '^引擎命令行') {
+            for ($sj = $si + 1; $sj -lt $allSet.Count -and $allSet[$sj] -match '^\s'; $sj++) {
+                $cmdLines += "  " + $allSet[$sj].Trim()
+            }
+            break
+        }
+    }
+}
+
 # 中文在终端里占两格、ASCII 占一格，用 String.PadRight 会算错（它只数字符数），
 # 结果就是带中文的那几行永远对不齐。这里自己数显示宽度。
 function Get-Width([string]$s) {
@@ -133,6 +154,8 @@ if (Test-Path $probeExe) {
     $probeText = (& powershell -NoProfile -ExecutionPolicy Bypass -File $probeExe -Probe 2>&1 | Out-String)
     if ($probeText) { $probeText = $probeText.Trim() }
 }
+# 这次探针把 当前设置.txt 覆盖成「只探测」的版本了，还原回用户真实那次启动的配置。
+if ($setSnapshot) { try { [IO.File]::WriteAllBytes($setFileTxt, $setSnapshot) } catch { } }
 
 # ---------------- 5. 组装 ----------------
 $gpuMain = if ($gpus.Count -gt 0) { $gpus[0].Name } else { "" }
@@ -196,6 +219,13 @@ if (Test-Path $histFile) {
 $out.Add("----- 启动器探测 -----")
 if ($probeText) { foreach ($l in ($probeText -split "`r?`n")) { $out.Add("  " + $l) } }
 else { $out.Add("  (没跑出结果)") }
+$out.Add("")
+# 拼好的引擎命令行。起不来的第一嫌疑就是参数（invalid literal / unrecognized argument
+# 这几句），而它以前从来不留痕 —— 只有屏幕上一闪而过，用户报障时无从复现。
+# 内容在脚本开头、探针跑之前就从 当前设置.txt 抄下来了（见那里的注释）。
+$out.Add("----- 引擎命令行 -----")
+if ($cmdLines.Count -gt 0) { foreach ($l in $cmdLines) { $out.Add($l) } }
+else { $out.Add("  (当前设置.txt 里没有 —— 启动器没跑到那一步，或者这份盘太旧)") }
 $out.Add("")
 # 引擎自己的日志尾巴。用户报「起不来」的时候，光有硬件信息判断不了 —— 真正的
 # 原因就写在 server-*.log 里（崩溃栈、缺 DLL、显存不够那几句原话）。让他自己
