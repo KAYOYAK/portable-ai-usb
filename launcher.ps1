@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.11.1"
+$AppVersion = "1.11.2"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -266,9 +266,32 @@ if (-not $model) {
 # 本盘用 -m 指定本地文件，自动检测不会生效。更要紧的是，引擎在找不到投影文件时
 # 有"自动下载"的路径 —— 那会联网，直接违背"零联网"承诺。
 # 所以这里两条路都写死：找到就显式指过去，没找到就显式关掉，不给引擎自己决定的机会。
-$mmproj = @(Get-ChildItem $DirModels -Filter "mmproj-*.gguf" -File -ErrorAction SilentlyContinue |
-            Sort-Object Length -Descending)
-if ($mmproj.Count -gt 0) { $mmproj = $mmproj[0] } else { $mmproj = $null }
+# 按模型名挑对应的投影文件。以前是「不管哪个，取体积最大的」—— 盘上只有一份时
+# 没问题，但 tools\换模型.ps1 会把 gemma 的 mmproj 也下到同一个 models\，
+# 两份并存时「最大的」未必是当前模型那份：MiMo 的 918 MB 会盖过 gemma 的 851 MB，
+# 于是切到 gemma 时喂进去的是 MiMo 的投影文件。视觉编码器对不上，比没有更糟 ——
+# 它不会报错，只会把图看错。
+# 匹配办法：两边都去掉「mmproj-」前缀、扩展名、以及末尾的量化/精度标记，
+# 剩下的基名相等就算同一家（MiMo-V2.6-Distill-Qwen-9B-Q5_K_M ↔ mmproj-MiMo-V2.6-Distill-Qwen-9B-f16）。
+function Get-MmprojBase([string]$n) {
+    $b = [IO.Path]::GetFileNameWithoutExtension($n)
+    if ($b -like 'mmproj-*') { $b = $b.Substring(7) }
+    return ($b -replace '-(?i)(I?Q\d[A-Za-z0-9_]*|BF16|F16|F32)$', '')
+}
+$projAll = @(Get-ChildItem $DirModels -Filter "mmproj-*.gguf" -File -ErrorAction SilentlyContinue)
+$mmproj = $null
+$mmprojMismatch = $false
+if ($projAll.Count -gt 0) {
+    $modelBase = Get-MmprojBase $model.Name
+    $fit = @($projAll | Where-Object { (Get-MmprojBase $_.Name) -eq $modelBase })
+    if ($fit.Count -gt 0) {
+        $mmproj = $fit | Sort-Object Length -Descending | Select-Object -First 1
+    } else {
+        # 名字对不上就退回体积最大的那份，但必须说出来 —— 悄悄喂错比不喂更糟。
+        $mmproj = $projAll | Sort-Object Length -Descending | Select-Object -First 1
+        $mmprojMismatch = $true
+    }
+}
 
 $modelGB = [math]::Round($model.Length / 1GB, 2)
 $alias   = [IO.Path]::GetFileNameWithoutExtension($model.Name)
@@ -276,6 +299,9 @@ Write-Host "  模型     : $($model.Name)" -ForegroundColor Green
 Write-Host "  模型大小 : $modelGB GB"
 if ($mmproj) {
     Write-Host "  视觉能力 :  开  ($($mmproj.Name))" -ForegroundColor Green
+    if ($mmprojMismatch) {
+        Write-Host "              [注意] 没有找到和当前模型同名的投影文件，用的是盘上最大的那份 —— 可能对不上，看图会乱。" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "  视觉能力 :  关  (models\ 里没有 mmproj-*.gguf)" -ForegroundColor DarkGray
 }

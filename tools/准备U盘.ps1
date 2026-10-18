@@ -50,6 +50,14 @@ $ModelMeta = @{
 $ModelSize = $ModelMeta[$Quant].Size
 $ModelSha  = $ModelMeta[$Quant].Sha
 
+# 多模态投影文件（视觉能力）。主模型是 image-text-to-text 的，缺了这份就只能纯文本 ——
+# 启动器会显示「视觉能力 : 关」，问它图里有什么它只能编。
+# 同一个仓库里 f16 / bf16 两份都有，这里用 f16：比 bf16 小 3 MB，而且本项目 gemma
+# 那份也是 f16，行为一致。
+$MmprojFile = "mmproj-MiMo-V2.6-Distill-Qwen-9B-f16.gguf"
+$MmprojSize = 918166048
+$MmprojSha  = "ff348f3180a63188aa7285db85f550fe38acb61dd013c599eb8bad08d2cc2576"
+
 # 官方预编译包（含大小与 SHA-256，下完自动校验）
 #
 # 这些值取自 GitHub Release 的资产元数据。两份 cuda13 曾经只写了大小、没写哈希，
@@ -326,10 +334,34 @@ if (Test-Path $modelDst) {
     }
 }
 
-# ---------------- 5.5 模型校验清单 ----------------
+# ---------------- 5.5 多模态投影文件（视觉能力） ----------------
+# 以前这一步完全没有：主模型是 image-text-to-text 的，但组装脚本只下模型本体，
+# 于是「重跑准备U盘」装出来的盘都是纯文本的，用户得自己去 HuggingFace 翻一个
+# mmproj-*.gguf 放进 models\ 才能看图。这属于重装必丢的东西，所以补进来。
+Step 5.5 "多模态投影文件"
+$haveProj = @(Get-ChildItem $dirModels -Filter "mmproj-*.gguf" -File -ErrorAction SilentlyContinue)
+if ($haveProj.Count -gt 0) {
+    OK "已有投影文件，跳过（$($haveProj[0].Name)）"
+} else {
+    Info "主模型是多模态的，补一个投影文件（$([math]::Round($MmprojSize / 1MB, 0)) MB），下完就能看图"
+    Info "来源：hf-mirror.com（HuggingFace 国内镜像）"
+    $projTmp = Join-Path $Stash "$MmprojFile.part"
+    if (-not (Get-File -Url "$ModelRepo/$MmprojFile" -Dest $projTmp -Expected $MmprojSize)) {
+        # 下不到不算致命：没有它照样能聊天，只是看不了图。别因此把整次组装判失败。
+        Warn "投影文件没下成功。不影响聊天，只是看不了图；可以重跑本脚本再试。"
+    } elseif (-not (Test-Sha256 $projTmp $MmprojSha)) {
+        Remove-Item $projTmp -Force -ErrorAction SilentlyContinue
+        Warn "投影文件校验失败，坏文件已删。不影响聊天，只是看不了图。"
+    } else {
+        Move-Item $projTmp (Join-Path $dirModels $MmprojFile) -Force
+        OK "视觉能力已就绪（启动时横幅会显示「视觉能力 : 开」）"
+    }
+}
+
+# ---------------- 5.6 模型校验清单 ----------------
 # 上面下载时验过一次哈希，但那个值只活在这次运行里。用户几个月后觉得「模型是不是
 # 坏了」时，手上没有任何基准。把实际哈希落到 models\校验.txt，tools\自检.ps1 拿它复查。
-Step 5.5 "模型校验清单"
+Step 5.6 "模型校验清单"
 $manifest = Join-Path $dirModels "校验.txt"
 $old = @{}
 if (Test-Path $manifest) {
