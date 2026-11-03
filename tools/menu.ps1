@@ -115,6 +115,7 @@ function Show-Menu {
     Write-Host "    [20] 检查有没有新版本"
     Write-Host "    [21] 清理 workspace 的旧备份  (攒多了占空间)"
     Write-Host "    [22] 对话历史      (logs\对话\ 里的每一次，挑一份看)"
+    Write-Host "    [23] 文档识别      (图片转 Markdown / 表格 / 公式，不占主模型的位置)"
     Write-Host ""
     Write-Host "    [0]  退出"
     Write-Host ""
@@ -867,6 +868,75 @@ while ($true) {
                 try { Start-Process notepad.exe -ArgumentList "`"$($fi.FullName)`"" }
                 catch { Write-Host "  打不开记事本，路径在上面，自己复制一下。" -ForegroundColor Yellow }
             }
+            Pause-Safe
+        }
+        "23" {
+            # 文档识别。用的是 models\ocr\ 里的 Xiaomi-OCR-0（0.8B），和主模型是
+            # 两个东西：主模型 6.4 GB 常驻显存，这个是「丢几张图进去、几秒出结果」
+            # 的一次性工具，跑完就关引擎，不占显存。
+            Clear-Safe
+            Write-Host ""
+            Write-Host "  ============================================================"
+            Write-Host "    文档识别  ·  图片转 Markdown"
+            Write-Host "  ============================================================"
+            Write-Host ""
+
+            $ocrDir = Join-Path $Root 'models\ocr'
+            if (-not (Test-Path $ocrDir)) {
+                Write-Host "  [错误] 还没有装 OCR 模型（models\ocr\ 不存在）" -ForegroundColor Red
+                Write-Host ""
+                Write-Host "  它和主模型是分开下的（约 750 MB），跑一次 tools\准备U盘.ps1" -ForegroundColor Gray
+                Write-Host "  会自动补上。或者手动把这几个文件放进 models\ocr\：" -ForegroundColor Gray
+                Write-Host "    Xiaomi-OCR-0-Q5_K_M.gguf      约 551 MB" -ForegroundColor Gray
+                Write-Host "    mmproj-Xiaomi-OCR-0-F16.gguf  约 198 MB" -ForegroundColor Gray
+                Write-Host ""
+                Pause-Safe
+                continue
+            }
+
+            Write-Host "  把文档图片转成 Markdown。适合：发票、收据、书页、表格、公式。" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "  输入图片路径（可以粘贴，多个用空格分开）" -ForegroundColor Yellow
+            Write-Host "  也可以直接给一个文件夹路径，处理里面所有图片" -ForegroundColor DarkGray
+            Write-Host ""
+            $inputPath = Read-Choice "  路径"
+            if ($null -eq $inputPath) { return }
+            $inputPath = $inputPath.Trim().Trim('"')
+            if (-not $inputPath) { continue }
+
+            Write-Host ""
+            Write-Host "  任务类型：" -ForegroundColor Yellow
+            Write-Host "    [1]  整页文档 → Markdown（默认，最常用）"
+            Write-Host "    [2]  只取文字"
+            Write-Host "    [3]  表格 → OTSL"
+            Write-Host "    [4]  公式 → LaTeX"
+            Write-Host ""
+            $tk = Read-Choice "  选哪个（直接回车 = 1）"
+            $taskName = switch ($tk) {
+                "2" { "text" }
+                "3" { "table" }
+                "4" { "formula" }
+                default { "doc" }
+            }
+
+            Write-Host ""
+            $scriptPath = Join-Path $PSScriptRoot '文档识别.ps1'
+            if (-not (Test-Path $scriptPath)) {
+                Write-Host "  [错误] 找不到 tools\文档识别.ps1" -ForegroundColor Red
+                Pause-Safe
+                continue
+            }
+            # 交给独立脚本做：它要起临时引擎、逐张处理、控制超时，
+            # 塞进菜单这个 switch 里会让本来就长的文件更难维护。
+            $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$scriptPath`"")
+            if (Test-Path -LiteralPath $inputPath -PathType Container) {
+                $argList += @("-Folder", "`"$inputPath`"")
+            } else {
+                $argList += @("-Image", "`"$inputPath`"")
+            }
+            $argList += @("-Task", $taskName)
+            & powershell @argList
+            Write-Host ""
             Pause-Safe
         }
         "0" { exit 0 }

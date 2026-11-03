@@ -84,11 +84,49 @@ concrt140.dll             vcomp140.dll
 
 ---
 
+## 5. Xiaomi-OCR-0 — 文档识别模型（v1.12.0 起，可选）
+
+- 上游仓库：<https://huggingface.co/xiaomi-research/Xiaomi-OCR-0>
+- 量化版本：<https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF>
+- 许可：**Apache-2.0**
+- 版权：小米 MiMo 团队（SeerRay-Lab）
+- 基座模型：[Qwen/Qwen3.5-0.8B-Base](https://huggingface.co/Qwen/Qwen3.5-0.8B-Base)（Apache-2.0）
+- 本 U 盘用 Q5_K_M 量化（551 MB）+ bf16 投影文件（198 MB）
+- 只在 `models\ocr\` 里，是菜单 `[23]` 用的独立组件，不参与聊天
+
+**再分发注意**：Apache-2.0 允许商用与再分发，但必须保留版权声明、
+许可文本，并说明修改（本项目只做量化，未改架构）。
+上游还提供了一份 arXiv 技术报告，引用时请注明。
+
+---
+
+## 6. MiMo Code — AI 编程助手（v1.12.0 起，可选）
+
+- 项目：<https://github.com/XiaomiMiMo/MiMo-Code>
+- 许可：**MIT**
+- 版权：Xiaomi MiMo
+- 本 U 盘用的是官方发布的 **独立可执行文件**，从作者的 FDS 拉取，未做任何修改，
+  也不经过 npm
+- **六个平台各放一份**：Windows x64 / arm64、macOS arm64 / x64、Linux x64 / arm64
+  （合计约 710 MB）。MiMo Code 是按平台发布不同二进制的，只放 Windows 那份的话，
+  插到 Mac 上这个功能就用不了
+- 它不需要 Node.js 运行时 —— 那是 npm 安装方式才需要的
+- 升级靠 `agent\版本.txt` 比对；`准备U盘.ps1` 发现版本不一致会重新下载
+
+> **这一项没有 SHA-256 可校验**：上游 FDS 不发布 `.sha256`（其他组件都有）。
+> `准备U盘.ps1` 的验证方式是「大小相符 + 解压后跑一次 `--version`」。
+
+**再分发注意**：MIT 允许自由再分发，保留版权声明与许可文本即可。
+
+---
+
 ## 一句话总结
 
 | 层 | 谁做的 | 许可 |
 |---|---|---|
 | 推理引擎 | llama.cpp 社区 | MIT |
 | 模型权重 | 小米 MiMo 团队（基座：通义千问） | MIT / Apache-2.0 |
+| 文档识别模型 | 小米 MiMo 团队（基座：Qwen3.5-0.8B） | Apache-2.0 |
+| AI 编程助手 | 小米 MiMo 团队 | MIT |
 | C++ 运行库 | Microsoft | 可再发行组件 |
 | 启动器 + 文档 | 本项目 | MIT |

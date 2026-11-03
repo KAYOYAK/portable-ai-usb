@@ -113,6 +113,56 @@ if ($mmprojFiles.Count -gt 0) {
     I ("视觉投影 {0}  ({1:N2} GB) —— 启动时会自动打开视觉能力" -f $mmprojFiles[0].Name, ($mmprojFiles[0].Length / 1GB))
 }
 
+# 文档识别模型（可选组件，Xiaomi-OCR-0）。它在 models\ocr\ 子目录里，不是聊天模型 ——
+# 缺了不影响启动，只是菜单 [23] 用不了，所以这里用「注意」而不是「缺失」。
+$dirOcrCheck = Join-Path $dirModels "ocr"
+if (Test-Path $dirOcrCheck) {
+    $ocrGguf = @(Get-ChildItem $dirOcrCheck -Filter "*.gguf" -File -ErrorAction SilentlyContinue)
+    $ocrBody = @($ocrGguf | Where-Object { $_.Name -notlike "mmproj-*" -and $_.Name -notlike "*.mmproj-*" })
+    $ocrProj = @($ocrGguf | Where-Object { $_.Name -like "mmproj-*" -or $_.Name -like "*.mmproj-*" })
+    if ($ocrBody.Count -eq 0) {
+        W "models\ocr\ 里没有 OCR 模型本体 —— 菜单 [23] 用不了（跑 tools\准备U盘.ps1 会补上）"
+    } elseif ($ocrProj.Count -eq 0) {
+        W "models\ocr\ 里没有投影文件 —— 菜单 [23] 能起引擎但看不见图"
+    } else {
+        P ("文档识别 {0}  ({1:N0} MB) + 投影 ({2:N0} MB) —— 菜单 [23] 可用" -f $ocrBody[0].Name, ($ocrBody[0].Length / 1MB), ($ocrProj[0].Length / 1MB))
+    }
+} else {
+    I "没有装文档识别模型（models\ocr\）—— 可选组件，不影响聊天"
+}
+
+# AI 编程助手（可选组件，MiMo Code）。二进制按平台放在 agent\<平台>\ 里，
+# 六个平台各一份。这里只查「盘上有哪几份」，不去执行它们 —— macOS/Linux 的
+# 那些在 Windows 上跑不了，能验的只有文件在不在、版本号是多少。
+$dirAgentChk = Join-Path $Root "agent"
+$mimoPlats = @("windows-x64", "windows-arm64", "darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64")
+if (Test-Path $dirAgentChk) {
+    $verFile = Join-Path $dirAgentChk "版本.txt"
+    $mimoVer = ""
+    if (Test-Path $verFile) {
+        try { $mimoVer = ([IO.File]::ReadAllText($verFile)).Trim() } catch { }
+    }
+    $havePlats = @($mimoPlats | Where-Object {
+        $binName = if ($_ -like "windows-*") { "mimo.exe" } else { "mimo" }
+        Test-Path (Join-Path $dirAgentChk (Join-Path $_ $binName))
+    })
+    if ($havePlats.Count -eq 0) {
+        W "agent\ 里没有可用的 mimo 二进制 —— AI编程.bat 用不了（跑 tools\准备U盘.ps1 会补上）"
+    } else {
+        $verTxt = if ($mimoVer) { "v$mimoVer" } else { "版本未知" }
+        P ("AI 编程 {0}：{1} / {2} 个平台" -f $verTxt, $havePlats.Count, $mimoPlats.Count)
+        $missPlats = @($mimoPlats | Where-Object { $havePlats -notcontains $_ })
+        if ($missPlats.Count -gt 0) {
+            I ("  没有这些平台：{0} —— 在那几台机器上 AI编程 用不了" -f ($missPlats -join ", "))
+        }
+        if (-not $mimoVer) {
+            I "  没有 agent\版本.txt —— 准备U盘.ps1 下次会当成旧版本重下"
+        }
+    }
+} else {
+    I "没有装 AI 编程助手（agent\）—— 可选组件，不影响聊天"
+}
+
 # 模型完整性。准备U盘.ps1 下载时验过一次哈希，但那个值不落盘就随着脚本结束一起
 # 消失了 —— 用户几个月后怀疑文件坏了，手上没有任何基准可以比。所以它会把每个
 # 模型的实际哈希写进 models\校验.txt，这里读那份清单来复查。
@@ -169,6 +219,10 @@ if ($models.Count -gt 0) {
         $onDisk = @{}
         foreach ($m in $models)       { $onDisk[$m.Name] = $true }
         foreach ($p in $mmprojFiles)  { $onDisk[$p.Name] = $true }
+        # 文档识别那两份也在清单里（准备U盘.ps1 的 5.7 会把它们补写进去），
+        # 但它们在 models\ocr\ 子目录，不在上面两个不递归的集合里 —— 漏了这行，
+        # 每个装了 OCR 的盘都会误报「盘上已经没有了」。
+        foreach ($p in @($ocrGguf))   { if ($p) { $onDisk[$p.Name] = $true } }
         $ghost = @($known.Keys | Where-Object { -not $onDisk.ContainsKey($_) })
         if ($ghost.Count -gt 0) {
             W "校验清单里有 $($ghost.Count) 个模型，盘上已经没有了： $($ghost -join ', ')"

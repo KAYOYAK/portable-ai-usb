@@ -36,6 +36,11 @@ DO_STOP=0
 DO_LIST=0
 DO_PROBE=0
 DO_BENCH=0
+DO_OCR=0
+OCR_INPUT=""
+OCR_TASK="doc"
+DO_AGENT=0
+AGENT_ARGS=()
 OPEN_BROWSER=1
 USE_SYSTEM_PROMPT=1     # 默认替客户端补一句"中文回答"，见下面的 DEFAULT_ZH_PROMPT
 CUSTOM_PROMPT=""        # --system-prompt 传进来的自定义句子
@@ -114,6 +119,9 @@ show_help() {
   --probe              只检测硬件和选中的模型，不真启动
   --bench              测一下这支盘的读取速度，估算要等多久
   --stop               停掉正在跑的 AI，然后退出
+  --ocr PATH           文档识别：把图片（或整个文件夹）转成 Markdown，然后退出
+  --task TYPE          --ocr 的任务类型：doc（默认）/ text / table / formula / kie
+  --agent [参数..]     AI 编程：用本盘上的 MiMo Code 驱动本地模型，然后退出
   --model NAME         用哪个模型（文件名可以只写一部分，例如 Qwen3-4B）
   --ctx N              上下文长度（默认按内存自动定）
   --ngl N              卸载到 GPU 的层数（默认 99）
@@ -141,6 +149,22 @@ while [ $# -gt 0 ]; do
         --probe)      DO_PROBE=1 ;;
         --bench)      DO_BENCH=1 ;;
         --stop)       DO_STOP=1 ;;
+        --ocr)        shift
+                      case "${1:-}" in
+                          "")   err "--ocr 后面要跟图片或文件夹路径"; printf '\n'; show_help; exit 1 ;;
+                          --*)  err "--ocr 后面要跟路径，不是选项：$1"; printf '\n'; show_help; exit 1 ;;
+                      esac
+                      DO_OCR=1; OCR_INPUT="$1" ;;
+        --task)       shift
+                      case "${1:-}" in
+                          "")   err "--task 后面要跟任务类型"; printf '\n'; show_help; exit 1 ;;
+                          doc|text|table|formula|kie) OCR_TASK="$1" ;;
+                          *)    err "--task 只能是 doc / text / table / formula / kie，收到：$1"; printf '\n'; show_help; exit 1 ;;
+                      esac ;;
+        # --agent 之后的所有参数原样交给 mimo，所以直接把剩下的都收进来。
+        --agent)      DO_AGENT=1; shift
+                      while [ $# -gt 0 ]; do AGENT_ARGS+=("$1"); shift; done
+                      break ;;
         --model)      shift
                       case "${1:-}" in
                           "")   err "--model 后面要跟模型名"; printf '\n'; show_help; exit 1 ;;
@@ -427,6 +451,284 @@ do_stop() {
     return 0
 }
 
+# ---------------------------------------------------------------- 文档识别
+# 和 Windows 那份 tools/文档识别.ps1 是同一套逻辑：临时起一个 OCR 引擎
+# （端口 8090）、处理完就关，不常驻显存。
+# 模型在 models/ocr/ 里，和聊天用的主模型是两个东西。
+
+# 模型作者给的官方模板。换词会明显掉质量 —— 他们是按这些 prompt 做的对齐训练。
+_ocr_prompt() {
+    case "$1" in
+        text)    printf '%s' 'Extract the text in the image.' ;;
+        table)   printf '%s' 'Parse the table in the image into OTSL.' ;;
+        formula) printf '%s' 'Identify the formula in the image and represent it using LATEX format.' ;;
+        kie)     printf '%s' 'Extract key information in the image' ;;
+        *)       printf '%s' 'Extract all information from the main body of the document image and represent it in markdown format, ignoring headers and footers. Tables should be expressed in OTSL format, formulas in the document should be represented using LATEX format, and the parsing should be organized according to the reading order.' ;;
+    esac
+}
+
+_ocr_mime() {
+    case "$1" in
+        *.jpg|*.jpeg|*.JPG|*.JPEG) printf 'image/jpeg' ;;
+        *.png|*.PNG)               printf 'image/png' ;;
+        *.webp|*.WEBP)             printf 'image/webp' ;;
+        *.bmp|*.BMP)               printf 'image/bmp' ;;
+        *.gif|*.GIF)               printf 'image/gif' ;;
+        *.tif|*.tiff|*.TIF|*.TIFF) printf 'image/tiff' ;;
+        *)                         printf 'image/jpeg' ;;
+    esac
+}
+
+do_ocr() {
+    local src="$1" task="${2:-doc}"
+    local dir_ocr="$DIR_MODELS/ocr"
+    head_line "文档识别  ·  Xiaomi-OCR-0（图片 → Markdown）"
+
+    if [ ! -d "$dir_ocr" ]; then
+        err "找不到 OCR 模型目录：$dir_ocr"
+        info "这是可选组件，和主模型分开下载的（约 750 MB）。"
+        info "用 Windows 上的 tools/准备U盘.ps1 组装时会自动补上，"
+        info "或者手动把这两个文件放进 models/ocr/："
+        info "  Xiaomi-OCR-0-Q5_K_M.gguf      约 551 MB"
+        info "  mmproj-Xiaomi-OCR-0-F16.gguf  约 198 MB"
+        return 1
+    fi
+
+    # 模型本体：排除 mmproj。两种命名都要认（mmproj-* 和 *.mmproj-*）。
+    local model="" proj="" f
+    for f in "$dir_ocr"/*.gguf; do
+        [ -e "$f" ] || continue
+        case "$(basename "$f")" in
+            mmproj-*|*.mmproj-*) proj="$f" ;;
+            *)                   [ -z "$model" ] && model="$f" ;;
+        esac
+    done
+    [ -n "$model" ] || { err "models/ocr/ 里没有 OCR 模型（*.gguf）"; return 1; }
+    [ -n "$proj" ]  || { err "models/ocr/ 里没有投影文件 —— 引擎看不见图"; return 1; }
+
+    # 先确认输入路径，再去找引擎。顺序反过来的话，用户把路径打错时
+    # 先看到的是「没有引擎」这种更靠后的错误，会往错的方向查。
+    local -a imgs=()
+    if [ -d "$src" ]; then
+        for f in "$src"/*; do
+            [ -e "$f" ] || continue
+            case "$f" in
+                *.jpg|*.jpeg|*.png|*.webp|*.bmp|*.gif|*.tif|*.tiff|\
+                *.JPG|*.JPEG|*.PNG|*.WEBP|*.BMP|*.GIF|*.TIF|*.TIFF) imgs+=("$f") ;;
+            esac
+        done
+    elif [ -f "$src" ]; then
+        imgs+=("$src")
+    else
+        err "找不到：$src"; return 1
+    fi
+    [ ${#imgs[@]} -gt 0 ] || { err "没有可处理的图片：$src"; return 1; }
+
+    local exe
+    exe="$(find_engine)" || { engine_hint; return 1; }
+
+    printf '  OCR 模型 :  %s\n' "$(basename "$model")"
+    printf '  投影文件 :  %s\n' "$(basename "$proj")"
+    printf '  待处理   :  %d 个文件，任务 = %s\n' "${#imgs[@]}" "$task"
+
+    local port=8090
+    if port_busy "$port"; then
+        err "端口 $port 被占用 —— 多半是上一次没关掉的 OCR 引擎。"
+        info "先停掉： bash 启动AI.sh --stop"
+        return 1
+    fi
+
+    mkdir -p "$DIR_LOGS" 2>/dev/null
+    local logf="$DIR_LOGS/ocr-$(date '+%Y%m%d-%H%M%S').log"
+
+    info "启动 OCR 引擎（0.8B，一般 3~6 秒）…"
+    "$exe" -m "$model" --mmproj "$proj" \
+        --host 127.0.0.1 --port "$port" \
+        --ctx-size 8192 --n-gpu-layers 99 --jinja --no-webui \
+        --temp 0 --top-k 1 >"${logf}.out" 2>"$logf" &
+    local pid=$!
+
+    local i ready=0
+    for i in $(seq 1 120); do
+        sleep 0.5
+        kill -0 "$pid" 2>/dev/null || break
+        if curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; then ready=1; break; fi
+    done
+    if [ "$ready" -ne 1 ]; then
+        err "OCR 引擎没能起来。日志最后 15 行："
+        tail -n 15 "$logf" 2>/dev/null | sed 's/^/           /'
+        kill "$pid" 2>/dev/null
+        return 1
+    fi
+    info "引擎就绪：http://127.0.0.1:$port"
+
+    local ok=0 bad=0 img mime base resp text out base_name nod prompt
+    local bodyf
+    bodyf="$(mktemp 2>/dev/null || echo "$DIR_LOGS/.ocr-body.$$")"
+    prompt="$(_ocr_prompt "$task")"
+
+    for img in "${imgs[@]}"; do
+        base_name="$(basename "$img")"; base_name="${base_name%.*}"
+        out="$(dirname "$img")/$base_name.md"
+        # 同一批里输出重名时加 -2 / -3，别让后一张盖掉前一张。
+        nod=2
+        while [ -e "$out" ] && [ "$nod" -le 100 ]; do
+            out="$(dirname "$img")/${base_name}-${nod}.md"
+            nod=$((nod + 1))
+        done
+
+        printf '\n  → %s.md  (%s)\n' "$base_name" "$(human "$(file_bytes "$img")")"
+        mime="$(_ocr_mime "$img")"
+        # base64 在 GNU 和 macOS 上默认换行行为不同，统一去掉换行，
+        # 否则 JSON 里会混进字面换行、请求体直接坏掉。
+        base="$(base64 < "$img" 2>/dev/null | tr -d '\n')"
+        if [ -z "$base" ]; then err "读不出图片：$img"; bad=$((bad + 1)); continue; fi
+
+        # 请求体写临时文件再 --data-binary @file：大图的 base64 可能有几十 MB，
+        # 塞进 shell 变量再走命令行参数会被 ARG_MAX 卡住。
+        printf '{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:%s;base64,%s"}},{"type":"text","text":"%s"}]}],"max_tokens":4096}' \
+            "$mime" "$base" "$prompt" > "$bodyf"
+
+        resp="$(curl -fsS -X POST "http://127.0.0.1:$port/v1/chat/completions" \
+                -H 'Content-Type: application/json' --data-binary "@$bodyf" 2>/dev/null)"
+        rm -f "$bodyf"
+        if [ -z "$resp" ]; then err "请求失败（引擎返回空）"; bad=$((bad + 1)); continue; fi
+
+        # 抠 content 字段。没装 jq 的机器很常见，所以用 sed；但有个坑：
+        # 返回是转义过的单行 JSON，字符串里的每个字面引号都是 \"。
+        # 直接 [^"]* 会在第一个引号处就停 —— 实测「他说\"你好\"」只能抠出「他说\」。
+        # Markdown 里引用、代码块、JSON 示例全都带引号，等于整段被截断。
+        # 所以先把转义序列换成不可能出现在正文里的控制字符，抠完再换回来。
+        text="$(printf '%s' "$resp" \
+                | sed 's/\\\\/\x02/g; s/\\"/\x01/g' \
+                | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' \
+                | sed 's/\x01/"/g; s/\x02/\\/g')"
+        if [ -z "$text" ]; then
+            err "返回里没有 content —— 可能上下文超了，或图片太大"
+            bad=$((bad + 1)); continue
+        fi
+        # 还原 JSON 转义：\n → 换行，\t → 制表符，\u003c 这类少见的不处理
+        # （llama-server 返回中文是直出 UTF-8，不是 \u 转义）。
+        printf '%s' "$text" | awk '{gsub(/\\n/,"\n"); gsub(/\\t/,"\t"); gsub(/\\r/,""); print}' > "$out"
+        ok=$((ok + 1))
+        info "已保存：$out"
+    done
+
+    rm -f "$bodyf" 2>/dev/null
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    printf '\n'
+    printf '  完成：成功 %d 个 / 失败 %d 个\n' "$ok" "$bad"
+    [ "$bad" -eq 0 ] || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------- AI 编程
+# 找出当前平台对应的那份 MiMo Code，把配置和数据指回 U 盘，然后交给它。
+do_agent() {
+    head_line "AI 编程  ·  MiMo Code + 本地模型"
+
+    local plat base
+    # PLATFORM_OS 是脚本早期按 uname 定下的，取值只有小写的 macos / linux；
+    # agent 的目录名用的是上游的 darwin-* / linux-*，所以这里要做一次映射。
+    case "$PLATFORM_OS" in
+        macos) base="darwin" ;;
+        linux) base="linux" ;;
+        *)     err "不支持的平台：$PLATFORM_OS"; return 1 ;;
+    esac
+    case "$ARCH" in
+        arm64|aarch64) plat="$base-arm64" ;;
+        x86_64|amd64)  plat="$base-x64" ;;
+        *)             err "不支持的架构：$ARCH"; return 1 ;;
+    esac
+
+    local exe="$ROOT/agent/$plat/mimo"
+    if [ ! -f "$exe" ]; then
+        err "找不到 agent/$plat/mimo"
+        info "这一项是单独下载的，不在 Git 仓库里。"
+        info "装法：用 Windows 上的 tools/准备U盘.ps1 组装一次，六个平台会一起补齐。"
+        local d
+        for d in "$ROOT"/agent/*/; do
+            [ -f "${d}mimo" ] && info "  盘上现有：$(basename "$d")"
+        done
+        return 1
+    fi
+    chmod +x "$exe" 2>/dev/null
+
+    # 主模型必须在跑。判断标准是「8080 上那个是不是本盘的模型」，
+    # 不是「8080 有没有人监听」—— 别人机器上的 llama-server 也可能占着。
+    local props model_path ctx
+    props="$(curl -fsS --max-time 3 "http://127.0.0.1:8080/props" 2>/dev/null)"
+    if [ -z "$props" ]; then
+        err "AI 编程要连本地模型，但它现在没在跑。"
+        info "请先在另一个窗口跑： bash 启动AI.sh --ctx 65536"
+        info "（一定要 64K —— 32K 下它跑两三轮就会报上下文超了。）"
+        return 1
+    fi
+    model_path="$(printf '%s' "$props" | sed -n 's/.*"model_path":"\([^"]*\)".*/\1/p')"
+    case "$model_path" in
+        "$ROOT"/*) : ;;
+        "")        err "8080 上的服务读不到模型路径，不确认是不是本盘的 —— 先停掉它"; return 1 ;;
+        *)         err "8080 上跑的不是本盘的模型：$model_path"; return 1 ;;
+    esac
+
+    ctx="$(printf '%s' "$props" | sed -n 's/.*"n_ctx":\([0-9]*\).*/\1/p')"
+    [ -n "$ctx" ] || ctx=32768
+
+    printf '  模型     :  %s\n' "$(basename "$model_path")"
+    printf '  上下文   :  %s tokens\n' "$ctx"
+    printf '  平台     :  %s\n' "$plat"
+
+    if [ "$ctx" -lt 65536 ]; then
+        printf '\n'
+        warn "上下文只有 $ctx，AI 编程很可能跑不完一轮工具调用。"
+        warn "实测这种配置下跑两三轮就会报 Context size has been exceeded。"
+        info "想正常用：先停掉模型，改成 bash 启动AI.sh --ctx 65536 重开。"
+        printf '\n'
+    fi
+
+    # 配置和数据全部落回 agent/ 下。MiMo Code 遵循 XDG，四个变量一设就够。
+    local cfgdir="$ROOT/agent/config" datadir="$ROOT/agent/data"
+    local cachedir="$ROOT/agent/cache" statedir="$ROOT/agent/state"
+    mkdir -p "$cfgdir/mimocode" "$datadir" "$cachedir" "$statedir" 2>/dev/null
+
+    # 每次重写：上下文可能因为 --ctx 而变，留旧值会误导模型。
+    cat > "$cfgdir/mimocode/mimocode.jsonc" <<EOF
+{
+  "\$schema": "https://mimo.xiaomi.com/mimocode/config.json",
+  "model": "local/mimo-9b",
+  "provider": {
+    "local": {
+      "name": "本机（U 盘）",
+      "npm": "@ai-sdk/openai-compatible",
+      "only_configured_models": true,
+      "models": {
+        "mimo-9b": {
+          "name": "MiMo-V2.6-Distill-Qwen-9B",
+          "tool_call": true,
+          "limit": { "context": $ctx, "output": 4096 }
+        }
+      },
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "none"
+      }
+    }
+  }
+}
+EOF
+
+    export XDG_CONFIG_HOME="$cfgdir"
+    export XDG_DATA_HOME="$datadir"
+    export XDG_CACHE_HOME="$cachedir"
+    export XDG_STATE_HOME="$statedir"
+
+    info "第一次用会问选模型，选 local/mimo-9b 就行。"
+    printf '\n'
+    "$exe" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+    return $?
+}
+
 # ================================================================ 主流程
 head_line "U盘 AI 便携版  ·  llama.cpp   （$PLATFORM_OS / $ARCH）"
 printf '  启动位置 : %s\n' "$ROOT"
@@ -435,6 +737,18 @@ if [ "$DO_STOP" = 1 ]; then
     # 把返回码透出去：没有 pgrep 的机器上啥也没停成，不能还报 0。
     # （"本来就没有在跑"那一支仍是 0 —— 那种情况停止是幂等的，不算失败。）
     do_stop
+    exit $?
+fi
+
+# 文档识别和 AI 编程都不需要走主启动流程（不加载 6.4 GB 的聊天模型），
+# 所以放在这里提前分流。它们自己会检查需要的东西在不在。
+if [ "$DO_OCR" = 1 ]; then
+    do_ocr "$OCR_INPUT" "$OCR_TASK"
+    exit $?
+fi
+
+if [ "$DO_AGENT" = 1 ]; then
+    do_agent
     exit $?
 fi
 

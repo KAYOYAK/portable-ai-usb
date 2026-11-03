@@ -58,6 +58,49 @@ $MmprojFile = "mmproj-MiMo-V2.6-Distill-Qwen-9B-f16.gguf"
 $MmprojSize = 918166048
 $MmprojSha  = "ff348f3180a63188aa7285db85f550fe38acb61dd013c599eb8bad08d2cc2576"
 
+# ---------------- 文档识别模型（Xiaomi-OCR-0，0.8B） ----------------
+# 和主模型是两个东西：主模型 6.4 GB 常驻显存负责聊天，这个是「图片转 Markdown」
+# 的一次性工具，跑完就关。放在 models\ocr\ 子目录 —— 启动器枚举模型时不递归，
+# 所以它永远不会被误选成聊天模型。
+#
+# 源仓库的文件名是后缀式（Xiaomi-OCR-0.mmproj-bf16.gguf），落地时改成 llama.cpp
+# 官方的前缀式（mmproj-Xiaomi-OCR-0-F16.gguf），和本项目其他投影文件保持一致。
+$OcrRepo      = "https://hf-mirror.com/prithivMLmods/Xiaomi-OCR-0-GGUF/resolve/main"
+$OcrModelFile = "Xiaomi-OCR-0.Q5_K_M.gguf"
+$OcrModelSize = 577999104
+$OcrModelSha  = "941843ae6fd31dc62eff7619eede813e6b3df664a6eb6a25bb8406fc65641e94"
+$OcrProjSrc   = "Xiaomi-OCR-0.mmproj-bf16.gguf"
+$OcrProjFile  = "mmproj-Xiaomi-OCR-0-F16.gguf"
+$OcrProjSize  = 207346624
+$OcrProjSha   = "634d6bc95781ebf4a3f06570a59859fa5082d488db540fd474bc6b4061aec90e"
+
+# ---------------- AI 编程助手（MiMo Code） ----------------
+# 它发布的是 Bun 编译的独立可执行文件，不是 npm 包里的 JS —— 所以这支盘
+# 不需要 Node 运行时，解压出一个可执行文件就能跑。
+#
+# 六个平台全放，和 llama.cpp 放三套引擎是一个道理：插到哪台机器上都能跑，
+# 不让用户卡在「你这台没有对应版本」。合计 zip 约 246 MB、解开约 780 MB。
+# 解开的文件放 agent\<平台>\ 里，agent.ps1 按当前平台找自己那份。
+#
+# 唯一一处不如本项目其他组件的地方：FDS 不发布 .sha256，所以这里没法像引擎和
+# 模型那样校验哈希，只能验大小 + 解压后跑一次 --version 确认真的能执行。
+# （macOS/Linux 的那几份没法在 Windows 上执行验证，只能验大小和压缩包结构。）
+$MimoVersion = "0.1.16"
+$MimoBase    = "https://mimocode.cnbj1.mi-fds.com/mimocode/mimocode"
+$MimoPlatforms = @(
+    @{ Id = "windows-x64";   Zip = "zip";    Size = 48123337 }   # Windows 主力
+    @{ Id = "windows-arm64"; Zip = "zip";    Size = 46376468 }   # Windows on ARM
+    @{ Id = "darwin-arm64";  Zip = "zip";    Size = 33821856 }   # Apple Silicon
+    @{ Id = "darwin-x64";    Zip = "zip";    Size = 36144524 }   # Intel Mac
+    @{ Id = "linux-x64";     Zip = "tar.gz"; Size = 46610714 }   # Linux 主力
+    @{ Id = "linux-arm64";   Zip = "tar.gz"; Size = 46276173 }   # ARM Linux
+)
+# 每个平台包解开后的可执行文件名。Windows 带 .exe，别的平台是裸文件。
+function Get-MimoExeName([string]$platformId) {
+    if ($platformId -like "windows-*") { return "mimo.exe" }
+    return "mimo"
+}
+
 # 官方预编译包（含大小与 SHA-256，下完自动校验）
 #
 # 这些值取自 GitHub Release 的资产元数据。两份 cuda13 曾经只写了大小、没写哈希，
@@ -394,11 +437,169 @@ foreach ($g in $ggufs) {
 [IO.File]::WriteAllText($manifest, ($mOut -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
 OK "校验.txt 已写入（$mCount 个模型）"
 
+# ---------------- 5.7 文档识别模型 ----------------
+# 可选组件：不下也能正常聊天，只是菜单 [23]「文档识别」用不了。
+# 所以失败只 Warn，不 Die —— 不能因为一个可选工具没下到就判整次组装失败。
+Step 5.7 "文档识别模型（可选）"
+$dirOcr = Join-Path $dirModels "ocr"
+if (-not (Test-Path $dirOcr)) { New-Item -ItemType Directory -Path $dirOcr -Force | Out-Null }
+
+$ocrModelDst = Join-Path $dirOcr $OcrModelFile
+$ocrProjDst  = Join-Path $dirOcr $OcrProjFile
+$ocrSkip = 0
+if (Test-Path $ocrModelDst) {
+    OK "OCR 模型已在，跳过（$([math]::Round((Get-Item $ocrModelDst).Length / 1MB)) MB）"
+    $ocrSkip++
+} else {
+    Info "下载 Xiaomi-OCR-0（0.8B，图片转 Markdown）—— $([math]::Round($OcrModelSize / 1MB)) MB"
+    $t = Join-Path $Stash "$OcrModelFile.part"
+    if (-not (Get-File -Url "$OcrRepo/$OcrModelFile" -Dest $t -Expected $OcrModelSize)) {
+        Warn "OCR 模型没下成功。不影响聊天，只是菜单 [23] 用不了。"
+    } elseif (-not (Test-Sha256 $t $OcrModelSha)) {
+        Remove-Item $t -Force -ErrorAction SilentlyContinue
+        Warn "OCR 模型校验失败，坏文件已删。不影响聊天。"
+    } else {
+        Move-Item $t $ocrModelDst -Force
+        OK "OCR 模型就位"
+    }
+}
+if (Test-Path $ocrProjDst) {
+    OK "OCR 投影文件已在，跳过（$([math]::Round((Get-Item $ocrProjDst).Length / 1MB)) MB）"
+} else {
+    Info "下载 OCR 投影文件 —— $([math]::Round($OcrProjSize / 1MB)) MB"
+    $t = Join-Path $Stash "$OcrProjSrc.part"
+    if (-not (Get-File -Url "$OcrRepo/$OcrProjSrc" -Dest $t -Expected $OcrProjSize)) {
+        Warn "OCR 投影文件没下成功。菜单 [23] 用不了。"
+    } elseif (-not (Test-Sha256 $t $OcrProjSha)) {
+        Remove-Item $t -Force -ErrorAction SilentlyContinue
+        Warn "OCR 投影文件校验失败，坏文件已删。"
+    } else {
+        Move-Item $t $ocrProjDst -Force
+        OK "OCR 投影文件就位（菜单 [23] 可用）"
+    }
+}
+
+# OCR 那两份也要进 models\校验.txt。顺序上 5.6 已经写完了清单（那时 OCR 还没下），
+# 而下载时验过的哈希不落盘就等于没验 —— 以后没人能复查这两个文件坏没坏。
+# 所以这里把已经就位的补写进去，已有的条目保留。
+$manifestOcr = Join-Path $dirModels "校验.txt"
+if (Test-Path $manifestOcr) {
+    try {
+        $exist = @{}
+        foreach ($ln in @(Get-Content $manifestOcr -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if ($ln -match '^\s*[0-9a-fA-F]{64}\s+\d+\s+(.+?)\s*$') { $exist[$Matches[1]] = $true }
+        }
+        $add = @()
+        foreach ($pair in @(@{ P = $ocrModelDst; S = $OcrModelSha }, @{ P = $ocrProjDst; S = $OcrProjSha })) {
+            if (-not (Test-Path $pair.P)) { continue }
+            $nm = Split-Path $pair.P -Leaf
+            if ($exist.ContainsKey($nm)) { continue }
+            $add += ("{0}  {1}  {2}" -f $pair.S.ToLower(), (Get-Item $pair.P).Length, $nm)
+        }
+        if ($add.Count -gt 0) {
+            $cur = [IO.File]::ReadAllText($manifestOcr)
+            if (-not $cur.EndsWith("`n")) { $cur += "`r`n" }
+            [IO.File]::WriteAllText($manifestOcr, $cur + ($add -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding($true)))
+            OK "校验清单补入 $($add.Count) 条 OCR 记录"
+        }
+    } catch {
+        Warn "OCR 记录没写进校验清单（$($_.Exception.Message)）—— 不影响使用。"
+    }
+}
+
+# ---------------- 5.8 AI 编程助手（可选） ----------------
+# MiMo Code 的发布物是 Bun 编的独立可执行文件，不需要 Node。所以这里只是
+# 「下压缩包、解出二进制」，不做 npm install，也不碰宿主机环境。
+#
+# 六个平台全下：插到哪台机器上都能跑。跑不了的平台那份也就 30~46 MB 压缩，
+# 解开 100 多 MB —— 相比 105 GB 的余量，不值得为省这点让用户卡住。
+Step 5.8 "AI 编程助手（可选）"
+$dirAgent = Join-Path $Target "agent"
+if (-not (Test-Path $dirAgent)) { New-Item -ItemType Directory -Path $dirAgent -Force | Out-Null }
+$mimoVerFile = Join-Path $dirAgent "版本.txt"
+# 只判「文件在不在」的话，升级版本时永远走不到下载分支 —— 盘上那份会一直停在
+# 出厂版本，而我们自己都不知道它旧了。所以先比对版本号，再逐平台补缺。
+$mimoHave = ""
+if (Test-Path $mimoVerFile) {
+    try { $mimoHave = ([IO.File]::ReadAllText($mimoVerFile)).Trim() } catch { }
+}
+$mimoUpgrade = ($mimoHave -ne $MimoVersion)
+if ($mimoUpgrade) {
+    if ($mimoHave) { Info "盘上是 v$mimoHave，目标 v$MimoVersion —— 逐平台更新" }
+    else { Info "准备 MiMo Code v$MimoVersion（6 个平台，合计约 246 MB，不需要 Node）" }
+}
+
+$mimoOkCount = 0
+$mimoFail = @()
+foreach ($mp in $MimoPlatforms) {
+    $pid2 = $mp.Id
+    $exeName = Get-MimoExeName $pid2
+    $pdir = Join-Path $dirAgent $pid2
+    $dst = Join-Path $pdir $exeName
+
+    # 版本一致且文件在 → 跳过这个平台
+    if ((-not $mimoUpgrade) -and (Test-Path $dst)) {
+        $mimoOkCount++
+        continue
+    }
+    if (-not (Test-Path $pdir)) { New-Item -ItemType Directory -Path $pdir -Force | Out-Null }
+
+    $archive = "mimocode-$pid2.$($mp.Zip)"
+    $url = "$MimoBase/releases/v$MimoVersion/$archive"
+    $tmpArc = Join-Path $Stash "$archive.$MimoVersion"
+    if (-not (Get-File -Url $url -Dest $tmpArc -Expected $mp.Size)) {
+        $mimoFail += $pid2
+        continue
+    }
+    $tmpEx = Join-Path $Stash "mimocode-unzip-$pid2"
+    try {
+        if (Test-Path $tmpEx) { Remove-Item $tmpEx -Recurse -Force }
+        New-Item -ItemType Directory -Path $tmpEx -Force | Out-Null
+        if ($mp.Zip -eq "tar.gz") { & tar.exe -xzf $tmpArc -C $tmpEx 2>&1 | Out-Null }
+        else { & tar.exe -xf $tmpArc -C $tmpEx 2>&1 | Out-Null }
+        $found = @(Get-ChildItem $tmpEx -Filter $exeName -File -Recurse -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 0) {
+            $mimoFail += $pid2
+            continue
+        }
+        Copy-Item $found[0].FullName $dst -Force
+        # 只有当前平台的能真跑一下验证。别的平台的包结构对不对，只能看它解出来
+        # 有没有那个二进制 —— Windows 上不可能执行 Linux 的 ELF。
+        $canRun = ($pid2 -eq "windows-x64") -or ($pid2 -eq "windows-arm64")
+        if ($canRun -and $pid2 -eq "windows-x64") {
+            $ver = (& $dst --version 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $ver) {
+                Remove-Item $dst -Force -ErrorAction SilentlyContinue
+                $mimoFail += $pid2
+                continue
+            }
+        }
+        $mimoOkCount++
+    } catch {
+        $mimoFail += $pid2
+    } finally {
+        Remove-Item $tmpEx -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $tmpArc -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($mimoFail.Count -eq 0) {
+    try { [IO.File]::WriteAllText($mimoVerFile, "$MimoVersion`r`n", (New-Object Text.UTF8Encoding($false))) } catch { }
+    OK "AI 编程助手就位：$mimoOkCount 个平台 / v$MimoVersion"
+} else {
+    Warn "AI 编程助手部分平台没下成功：$($mimoFail -join ', ')"
+    Warn "不影响聊天和文档识别；那几台上 AI编程 会用不了。重跑本脚本可以补。"
+    # 版本文件只在全部成功时写 —— 否则下次会以为已经是最新、不再补缺。
+    if ($mimoOkCount -gt 0 -and -not (Test-Path $mimoVerFile)) {
+        try { [IO.File]::WriteAllText($mimoVerFile, "partial-$(Get-Date -Format 'yyyyMMdd')`r`n", (New-Object Text.UTF8Encoding($false))) } catch { }
+    }
+}
+
 # ---------------- 6. 启动器 ----------------
 Step 6 "启动器文件"
 # 启动AI.sh 是给 macOS / Linux 用的。这支 U 盘插到 Mac 上也要能用，
 # 所以即使在 Windows 上组装，这一份也必须一起带上。
-foreach ($f in @("launcher.ps1", "启动AI.bat", "高级选项.bat", "启动AI.sh", "使用说明.txt")) {
+foreach ($f in @("launcher.ps1", "启动AI.bat", "高级选项.bat", "AI编程.bat", "启动AI.sh", "使用说明.txt")) {
     $s = Join-Path $Root $f
     if (Test-Path $s) { Copy-Item $s $Target -Force; OK $f }
     else { Warn "仓库里找不到 $f" }
@@ -423,6 +624,31 @@ foreach ($name in $want) {
     if (Test-Path $p) { $exeCount++; OK "$name  llama-server.exe  OK" } else { Warn "$name  缺失 llama-server.exe" }
 }
 if (Test-Path $modelDst) { OK "模型 $([math]::Round((Get-Item $modelDst).Length / 1GB, 2)) GB" } else { Warn "模型缺失" }
+
+# 两个可选组件也要在结果里露一面 —— 否则用户不知道菜单 [23] 和 AI编程.bat
+# 到底能不能用，得自己去翻目录才知道。
+$ocrBodyChk = @(Get-ChildItem $dirOcr -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike "mmproj-*" -and $_.Name -notlike "*.mmproj-*" })
+$ocrProjChk = @(Get-ChildItem $dirOcr -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "mmproj-*" -or $_.Name -like "*.mmproj-*" })
+if ($ocrBodyChk.Count -gt 0 -and $ocrProjChk.Count -gt 0) {
+    OK "文档识别 就绪（菜单 [23]）"
+} else {
+    Info "文档识别 未安装 —— 不影响聊天，只是菜单 [23] 用不了"
+}
+# AI 编程：数一下真的落盘了几个平台，而不是只看某一个文件在不在。
+$mimoHaveCount = @($MimoPlatforms | Where-Object {
+    $d = Join-Path $dirAgent $_.Id
+    Test-Path (Join-Path $d (Get-MimoExeName $_.Id))
+}).Count
+if ($mimoHaveCount -gt 0) {
+    OK "AI 编程 就绪（$mimoHaveCount / $($MimoPlatforms.Count) 个平台，AI编程.bat）"
+    if ($mimoHaveCount -lt $MimoPlatforms.Count) {
+        Info "  缺平台的机器上这个功能用不了；重跑本脚本会补。"
+    }
+} else {
+    Info "AI 编程 未安装 —— 不影响聊天，只是 AI编程.bat 用不了"
+}
 
 $usedGB = [math]::Round((Get-ChildItem $Target -Recurse -File -ErrorAction SilentlyContinue |
            Measure-Object -Property Length -Sum).Sum / 1GB, 2)

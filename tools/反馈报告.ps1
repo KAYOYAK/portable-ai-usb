@@ -220,6 +220,42 @@ $out.Add("----- 启动器探测 -----")
 if ($probeText) { foreach ($l in ($probeText -split "`r?`n")) { $out.Add("  " + $l) } }
 else { $out.Add("  (没跑出结果)") }
 $out.Add("")
+
+# 两个可选组件。用户报的 bug 很可能就在这两块上（文档识别出来的格式不对、
+# AI 编程连不上模型），而它们的装没装、什么版本，从别处都看不出来。
+$out.Add("----- 可选组件 -----")
+$ocrDirRep = Join-Path $Root "models\ocr"
+if (Test-Path $ocrDirRep) {
+    $ocrAll = @(Get-ChildItem $ocrDirRep -Filter "*.gguf" -File -ErrorAction SilentlyContinue)
+    $ocrBodyRep = @($ocrAll | Where-Object { $_.Name -notlike "mmproj-*" -and $_.Name -notlike "*.mmproj-*" })
+    $ocrProjRep = @($ocrAll | Where-Object { $_.Name -like "mmproj-*" -or $_.Name -like "*.mmproj-*" })
+    if ($ocrBodyRep.Count -gt 0 -and $ocrProjRep.Count -gt 0) {
+        $out.Add(("  文档识别 : 就绪  ({0} / {1:N0} MB + 投影 {2:N0} MB)" -f $ocrBodyRep[0].Name, ($ocrBodyRep[0].Length / 1MB), ($ocrProjRep[0].Length / 1MB)))
+    } elseif ($ocrBodyRep.Count -gt 0) {
+        $out.Add("  文档识别 : 只有模型、缺投影文件 —— 能起引擎但看不见图")
+    } else {
+        $out.Add("  文档识别 : models\ocr\ 里没有模型")
+    }
+} else {
+    $out.Add("  文档识别 : 未安装（models\ocr\ 不存在）")
+}
+$agentDirRep = Join-Path $Root "agent"
+if (Test-Path $agentDirRep) {
+    $verRep = ""
+    $vfRep = Join-Path $agentDirRep "版本.txt"
+    if (Test-Path $vfRep) { try { $verRep = ([IO.File]::ReadAllText($vfRep)).Trim() } catch { } }
+    $platsRep = @("windows-x64", "windows-arm64", "darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64")
+    $haveRep = @($platsRep | Where-Object {
+        $bn = if ($_ -like "windows-*") { "mimo.exe" } else { "mimo" }
+        Test-Path (Join-Path $agentDirRep (Join-Path $_ $bn))
+    })
+    $vTxt = if ($verRep) { "v$verRep" } else { "版本未知" }
+    $out.Add(("  AI 编程  : {0}，{1} / {2} 个平台（本机是 {3}）" -f $vTxt, $haveRep.Count, $platsRep.Count, $env:PROCESSOR_ARCHITECTURE))
+} else {
+    $out.Add("  AI 编程  : 未安装（agent\ 不存在）")
+}
+$out.Add("")
+
 # 拼好的引擎命令行。起不来的第一嫌疑就是参数（invalid literal / unrecognized argument
 # 这几句），而它以前从来不留痕 —— 只有屏幕上一闪而过，用户报障时无从复现。
 # 内容在脚本开头、探针跑之前就从 当前设置.txt 抄下来了（见那里的注释）。
