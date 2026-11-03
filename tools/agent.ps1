@@ -170,7 +170,28 @@ $env:XDG_DATA_HOME   = $dataHome
 $env:XDG_CACHE_HOME  = $cacheHome
 $env:XDG_STATE_HOME  = $stateHome
 
-# ---------------- 4. 交给 mimo.exe ----------------
+# ---------------- 4. 切到能当项目目录的地方 ----------------
+# MiMo Code 有两条独立的检查：第一条是「信任这个目录」的确认框（可以点确认过），
+# 第二条是硬性拒绝 —— 它不接受「文件系统根目录」作为项目目录。日志里是：
+#   Access denied: filesystem root is not a valid project directory
+#   tui bootstrap failed
+# 而 AI编程.bat 用 pushd %~dp0 把当前目录设成了 U 盘根（E:\），正好撞上第二条。
+# 表现就是：点完「我了解风险」，窗口直接关掉，什么都不显示。
+# 所以这里自动切到 workspace\ —— 那本来就是「AI 能看见的文件夹」，
+# 把要改的代码放进去正好。
+$workDir = (Get-Location).Path
+$isFsRoot = ($workDir -match '^[A-Za-z]:\\?$')
+if ($isFsRoot) {
+    $workDir = Join-Path $Root "workspace"
+    if (-not (Test-Path $workDir)) { New-Item -ItemType Directory -Path $workDir -Force | Out-Null }
+    Write-Host ""
+    Say "工作目录 :  $workDir" "Yellow"
+    Say "            （U 盘根目录不能当项目目录，MiMo Code 会拒绝启动）" "DarkGray"
+    Say "            把要改的代码放进 workspace\ 即可。" "DarkGray"
+    Set-Location $workDir
+}
+
+# ---------------- 5. 交给 mimo.exe ----------------
 Write-Host ""
 Say "第一次用会问选模型，选 local/mimo-9b 就行。" "DarkGray"
 Say "退出：在界面里按 Esc，或者 Ctrl+C。" "DarkGray"
@@ -188,5 +209,27 @@ try {
     [Console]::Write("$esc[?25h$esc[?1049l")
     [Console]::Out.Flush()
 } catch { }
+
+# 非 0 退出时把 mimo 自己的日志尾巴打出来。它失败时窗口一闪就没，
+# 用户根本看不到原因 —— 上次那个「根目录不能当项目目录」就是这样
+# 排查了半天。日志在 agent\data\mimocode\log\ 下。
+if ($code -ne 0) {
+    Write-Host ""
+    Say "[MiMo Code 异常退出，退出码 $code]" "Red"
+    $logDir = Join-Path $dataHome "mimocode\log"
+    if (Test-Path $logDir) {
+        $latest = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latest) {
+            Say "日志最后几行（$($latest.Name)）：" "DarkGray"
+            try {
+                Get-Content $latest.FullName -Encoding UTF8 -ErrorAction SilentlyContinue |
+                    Select-Object -Last 8 | ForEach-Object { Say "  $_" "DarkGray" }
+            } catch { }
+        }
+    }
+    Write-Host ""
+    Say "完整日志：$logDir" "DarkGray"
+}
 
 exit $code

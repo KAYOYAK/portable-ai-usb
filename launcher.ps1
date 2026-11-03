@@ -60,7 +60,7 @@ param(
     [switch]$CheckUpdate           # 只查有没有新版本，不启动
 )
 
-$AppVersion = "1.12.0"
+$AppVersion = "1.12.1"
 
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }

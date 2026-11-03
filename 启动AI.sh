@@ -723,6 +723,15 @@ EOF
     export XDG_CACHE_HOME="$cachedir"
     export XDG_STATE_HOME="$statedir"
 
+    # MiMo Code 不接受「文件系统根目录」当项目目录。日志里是
+    #   Access denied: filesystem root is not a valid project directory
+    # Linux 上 U 盘一般挂在 /media/xxx 下不会撞到，但从 / 起就是另一回事。
+    if [ "$(pwd -P)" = "/" ]; then
+        local wd="$ROOT/workspace"
+        mkdir -p "$wd" 2>/dev/null && cd "$wd" 2>/dev/null || true
+        warn "当前是文件系统根目录，已切到 $wd"
+    fi
+
     info "第一次用会问选模型，选 local/mimo-9b 就行。"
     printf '\n'
     "$exe" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
