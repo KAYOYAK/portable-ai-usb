@@ -4,8 +4,6 @@
 
 ![对话演示：逐字输入「用 Python 写一个判断回文的函数」，模型流式输出代码和思路，底部显示 298 tokens / 5.7 秒 / 52.60 tokens/s](docs/usb-demo.gif)
 
-![界面截图：浏览器里的聊天界面，模型 MiMo-V2.6-Distill-Qwen-9B，右下角显示当前模型](docs/usb-chat.png)
-
 一个 9B 参数的大模型，连同推理引擎、运行库、聊天界面，全部躺在一支普通 U 盘里。
 换一台电脑、换一个盘符、换一套显卡，插上去双击 `启动AI.bat` 就行。
 对方电脑上什么都没装过也能跑：不用装 Python，不用装 CUDA，不用装 Visual C++ 运行库，不用联网。
@@ -15,6 +13,37 @@ U盘 ──插入──> 陌生电脑 ──双击──> 浏览器打开 http:/
                                     ↑
                            全过程零联网、零安装、零残留
 ```
+
+---
+
+## 双击之后会发生什么
+
+启动器先探这台电脑，再决定怎么跑 —— 显卡、驱动、显存放得下多少层、上下文开多大，
+**全部自动**，不需要你选：
+
+![启动过程：探测到 cuda13 可用 → 选 NVIDIA CUDA 后端 → 上下文 32768 / 卸载 99 层 / KV q8_0](docs/usb-boot.gif)
+
+这一屏是启动时真实打印的（每台机器不一样）：
+
+![环境检测输出：模型 MiMo-V2.6-Distill-Qwen-9B-Q5_K_M 6.02 GB，视觉能力开，显卡 NVIDIA RTX 5070 Ti Laptop 11.9 GB，cuda13 可用已选后端，上下文 32768 tokens，U 盘顺序读 1069.6 MB/s](docs/usb-detect.png)
+
+它做了这些判断：
+
+| 判断 | 依据 | 输出 |
+|---|---|---|
+| 用哪个后端 | 逐个试 `llama-server.exe --list-devices` | `cuda13 可用` → NVIDIA CUDA 13.4 |
+| 上下文多大 | 显存容量分档 | 11.9 GB → 32768 tokens |
+| 卸载多少层 | 模型大小 vs 显存 | 99 层（全部）|
+| KV 精度 | 剩余显存 | q8_0 |
+| 要不要 mmap | 有没有 `-LoadMode none` | 默认开（慢盘可关）|
+
+然后实测这支盘的读取速度，给出加载时间预估：
+
+![加载进度：正在把模型读进内存，进度条显示 5s / 约11s](docs/usb-loading.png)
+
+> 实测速度是**绕过系统缓存**测的（`FILE_FLAG_NO_BUFFERING`），不是 OS 缓存的假数字。
+
+---
 
 > **这个项目没有推广，只有一个人在做。** 如果它帮到你了，回个 star；更欢迎在
 > [Issues](https://github.com/KAYOYAK/portable-ai-usb/issues) 里留一句你的硬件和实测速度 ——
@@ -609,6 +638,10 @@ llama.cpp 官方的 Windows 包已经做了**运行时 CPU 分发**
 ---
 
 ## 目录结构
+
+约 7.0 GB，模型 / 引擎 / 脚本全在里面：
+
+![目录结构：启动AI.bat、高级选项.bat、launcher.ps1、models\（6.02 GB 模型 + 0.86 GB 视觉投影）、llama.cpp\（cuda13 / vulkan / cpu 三套引擎）、tools\（自检 / 换模型 / 文档识别 / 准备U盘）](docs/usb-tree.png)
 
 ```
 U盘根目录/
